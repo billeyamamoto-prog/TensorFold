@@ -547,9 +547,11 @@ pub fn Pass(comptime Tri: type) type {
                 }
                 if (hc.fuses(self, lw.attn_hc, n, keep.attn_hc)) {
                     try hc.writebackNorm(self, lw.attn_hc, 0, n);
+                    if (@import("cuda_steer.zig").get()) |p| try p.projectLayer(self.stream, s.h, n, layer); // ours: GLP subtracts the refusal direction from the mixed streams of this layer
                     try hc.readoutNative(self, lw.attn_hc, 0, n);
                 } else {
                     try self.writeback(0, n);
+                    if (@import("cuda_steer.zig").get()) |p| try p.projectLayer(self.stream, s.h, n, layer); // ours: GLP subtracts the refusal direction from the mixed streams of this layer
                     try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
                 }
                 self.zero_slices = zs.usable(self.s.part_zero, keep.mix_branch, self.m.collective != null, lw.out.native != null);

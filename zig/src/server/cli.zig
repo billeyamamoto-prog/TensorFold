@@ -39,6 +39,8 @@ const cuda_build = builtin.os.tag == .linux;
 
 /// Python serve flags plus this binary's native-only flags; supported flags are marked native.
 pub const flags = [_]Flag{
+    .{ .name = "--glp", .native = true }, // ours: GLP control vector (weightless steering)
+    .{ .name = "--glp-alpha", .native = true }, // ours: projection strength over the vector file
     .{ .name = "--host", .native = true },
     .{ .name = "--allowed-host", .kind = .append, .native = true },
     .{ .name = "--allowed-origin", .kind = .append, .native = true },
@@ -239,6 +241,7 @@ pub const Args = struct {
     drafter_name: ?[]const u8 = null, // retained before hub resolution for the engine's serving line
     drafter_bits: u8 = 4,
     rope_yarn: ?f64 = null, // YaRN with this factor over the checkpoint's trained window (Qwen3.5/3.6 on CUDA)
+    glp: ?@import("glp_startup.zig").Vec = null, // --glp: the control vector file and the strength in force
     record: ?[]const u8 = null, // drafter training rows written under this folder
     kv_cache: []const u8 = "bf16", // fp8: e4m3 attention caches with a scale a row, about twice the context
     prompt_precision: []const u8 = "bf16", // int8: prompt matmuls quantize their inputs to int8 a 64-input group
@@ -346,6 +349,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
     var env_buf: [192]u8 = undefined; // a prefill variable the lane host would misread: refused here, by name
     if (api.prefill_env.problem(&env_buf)) |why| return fail(u, a, "{s}", .{why});
     try spillWith(u, a, out);
+    if (try @import("glp_startup.zig").read(a, &out.glp)) |why| return fail(u, a, "{s}", .{why});
     return out;
 }
 
@@ -480,7 +484,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--decode-share")) {
         out.decode_share = try float(u, a, name, v);
         if (!(out.decode_share.? >= 0 and out.decode_share.? < 1)) return fail(u, a, "argument --decode-share: expected a share from 0 to under 1: '{s}'", .{v});
-    } else if (is(name, "--prompt-seed")) out.prompt_seed = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--instruct-sampling")) out.instruct_sampling = if (try @import("family_sampling.zig").pairsProblem(a, v)) |why| return fail(u, a, "argument {s}: {s}: '{s}'", .{ name, why, v }) else v else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--loop-guard-stop")) out.loop_guard_stop = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--prompt-precision")) out.prompt_precision = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--idle-unload")) out.idle_unload = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+    } else if (is(name, "--prompt-seed")) out.prompt_seed = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--instruct-sampling")) out.instruct_sampling = if (try @import("family_sampling.zig").pairsProblem(a, v)) |why| return fail(u, a, "argument {s}: {s}: '{s}'", .{ name, why, v }) else v else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--loop-guard-stop")) out.loop_guard_stop = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--glp")) out.glp = @import("glp_startup.zig").withPath(out.glp, v) else if (is(name, "--glp-alpha")) out.glp = @import("glp_startup.zig").withAlpha(out.glp, @import("glp_startup.zig").strength(v) orelse return fail(u, a, "argument --glp-alpha: expected a finite strength above 0: '{s}'", .{v})) else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--prompt-precision")) out.prompt_precision = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--idle-unload")) out.idle_unload = try int(u, a, name, v) else if (is(name, "--compact-at")) {
         out.compact_auto = std.mem.eql(u8, v, "auto"); // each occurrence replaces both fields, so the last one wins
         out.compact_fraction = null;
         if (!out.compact_auto) {
@@ -545,6 +549,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .drafter_name = args.drafter_name orelse args.drafter,
         .drafter_bits = args.drafter_bits,
         .rope_yarn = args.rope_yarn,
+        .glp = try @import("glp_startup.zig").engine(a, dir, model_type, args.backend, args.glp),
         .record = args.record,
         .kv8 = std.mem.eql(u8, args.kv_cache, "fp8"),
         .prompt_int8 = std.mem.eql(u8, args.prompt_precision, "int8"),

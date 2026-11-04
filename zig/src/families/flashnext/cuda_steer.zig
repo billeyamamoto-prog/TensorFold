@@ -40,24 +40,12 @@ pub const Plan = struct {
     dirs: []?cuda.DeviceBuffer,
 
     /// Put the vector on the device; a direction whose width or layer id does not fit the model refuses.
+    /// A failed upload frees the buffers that had landed, so a retry of the same vector is safe:
+    /// no device or host memory is held behind a refusal.
     pub fn init(d: *const cuda.Driver, a: Allocator, src: Source) InitError!Plan {
         if (src.mode != .project) return error.BadSource; // the CUDA lane subtracts the refusal component only
         if (src.hidden == 0 or src.streams == 0) return error.BadSource;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
-        var plan: Plan = .{
-            .a = a,
-            .alpha = src.alpha,
-            .hidden = src.hidden,
-            .streams = src.streams,
-            .module = undefined,
-            .project_fn = undefined,
-            .dirs = try a.alloc(?cuda.DeviceBuffer, @max(src.layers_total, 1)),
-        };
-        for (plan.dirs) |*slot| slot.* = null;
-        errdefer {
-            for (plan.dirs) |*slot| if (slot.*) |*b| b.free();
-            a.free(plan.dirs);
-        }
         for (src.layers) |l| {
             if (l.id >= src.layers_total) return error.BadSource;
         }
@@ -66,24 +54,43 @@ pub const Plan = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.BadSource => return error.BadSource,
         };
-        defer for (dirs) |dd| if (dd) |v| a.free(v);
-        defer a.free(dirs);
-        for (dirs, 0..) |dd, i| {
-            const dir = dd orelse continue;
-            plan.dirs[i] = cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dir)) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.Cuda,
-            };
+        errdefer { // the array's errdefer is installed last: it can never double-free with the uploads' below
+            for (dirs) |dd| if (dd) |v| a.free(v);
+            a.free(dirs);
         }
-        plan.module = cuda.Module.load(d, cuda.kernels.flashnext_glp) catch |e| switch (e) {
+        const module = cuda.Module.load(d, cuda.kernels.flashnext_glp) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Cuda,
         };
-        plan.project_fn = plan.module.function("fn_glp_project") catch |e| switch (e) {
+        errdefer module.unload(); // ours: a refused vector leaves no module loaded on the device
+        const project_fn = module.function("fn_glp_project") catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Cuda,
         };
-        return plan;
+        // The slots are filled by one all-or-nothing block: a buffer that failed to reach the device
+        // frees the ones already uploaded, so the array's own cleanup never sees a freed buffer.
+        const slots = blk: {
+            const s = a.alloc(?cuda.DeviceBuffer, @max(src.layers_total, 1)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => unreachable,
+            };
+            var uploaded: usize = 0;
+            errdefer {
+                for (s[0..uploaded]) |*slot| if (slot.*) |*b| b.free();
+                a.free(s);
+            }
+            for (s) |*slot| slot.* = null;
+            for (dirs, 0..) |dd, i| {
+                const dir = dd orelse continue;
+                s[i] = cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dir)) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.Cuda,
+                };
+                uploaded = i + 1;
+            }
+            break :blk s;
+        };
+        return .{ .a = a, .alpha = src.alpha, .hidden = src.hidden, .streams = src.streams, .module = module, .project_fn = project_fn, .dirs = slots };
     }
 
     pub fn deinit(self: *Plan) void {

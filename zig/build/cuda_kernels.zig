@@ -29,6 +29,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "experts_rows", .flags = &.{"-O3"} }, // experts.cu's decode sums over a window or prompt chunk's rows
     .{ .name = "route_rows", .flags = glue }, // ours: router logits and softmax top-k rows (cuda/route_rows.zig)
     .{ .name = "flashnext_hc", .flags = glue }, // ours: Flash Next's hyper-connection and n-gram glue
+    .{ .name = "flashnext_glp", .flags = glue }, // ours: GLP refusal-direction projection on the h-c residual streams
     .{ .name = "flashnext_attn", .flags = glue }, // ours: Flash Next's attention glue and its indexer's pooling and scores
     .{ .name = "experts3", .flags = &.{"-O3"} }, // ours: 3-bit experts on experts.cu's steps, nibble words from planes
     .{ .name = "experts3_prefill", .flags = &.{"-O3"} },

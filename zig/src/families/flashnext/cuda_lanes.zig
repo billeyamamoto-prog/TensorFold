@@ -14,6 +14,7 @@ const planStop = @import("cuda_prompt_chunks.zig").planStop;
 const round_costs = @import("cuda_round_costs.zig");
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
+const cuda_steer = @import("cuda_steer.zig"); // ours: GLP control vectors on the residual streams
 const config = @import("cuda_config.zig");
 const Glue = @import("cuda_glue.zig").Glue;
 const living = @import("living");
@@ -37,6 +38,10 @@ pub fn Namespace(comptime Tri: type) type {
     return struct {
         pub const model_type = "qwen4_exp";
         pub const tp_draft_snapshots = false;
+        /// ours: GLP control vectors on this model: the plan, its depth and the stream count it fits.
+        pub const steer = cuda_steer;
+        pub const steer_layers: usize = weights.layers_n;
+        pub const steer_streams: usize = weights.streams;
         pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
         pub const default_context: i64 = @intCast(prompt.max_tokens);

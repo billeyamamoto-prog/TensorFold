@@ -20,6 +20,10 @@ pub const seedFor = lanes.sampling.seedFor;
 
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
+/// GLP control vectors: the file format, the checks and the strength (weightless, in-model steering).
+pub const glp = @import("glp.zig");
+/// The control vector a serve applies to the residual stream (--glp).
+pub const Glp = glp.Glp;
 
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct {
@@ -267,6 +271,8 @@ pub const Open = struct {
     /// --drafter: a draft model's directory (Qwen3.8-27B's DFlash2; null: none), and --drafter-bits: 4, or 0 for bf16.
     drafter: ?[]const u8 = null,
     drafter_bits: u8 = 4,
+    /// --glp: the control vector the engine applies to the residual stream (null: none).
+    glp: ?Glp = null,
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,

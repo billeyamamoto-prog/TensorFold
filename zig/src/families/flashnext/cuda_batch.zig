@@ -736,6 +736,7 @@ pub fn Pass(comptime Tri: type) type {
                     try self.pleBlock(lw, ids);
                 }
                 try self.writeback(0, n);
+                if (@import("cuda_steer.zig").get()) |p| try p.projectLayer(self.stream, s.h, n, layer); // ours: GLP subtracts the refusal direction from the mixed streams of this layer
                 try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
                 if (lw.linear) {
                     try self.gdnBlock(lw, layer, wt.linearIndex(layer), keep);

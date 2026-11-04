@@ -325,6 +325,30 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
+    if (o.glp) |gv| { // ours: --glp: the control vector this serve steers with; every pass reads the process plan
+        if (!@hasDecl(F, "steer")) {
+            problem.* = try std.fmt.allocPrint(a, "--glp: the {s} engine applies no control vector", .{o.model_type});
+            return null;
+        }
+        if (F.steer.get() == null) {
+            const S = F.steer;
+            const layers = try a.alloc(S.Layer, gv.vector.layers.len);
+            for (gv.vector.layers, 0..) |l, i| layers[i] = .{ .id = l.id, .dir = l.dir };
+            const plan = try a.create(S.Plan);
+            plan.* = S.Plan.init(&g.driver, a, .{
+                .mode = if (gv.vector.mode == .add) S.Mode.add else S.Mode.project,
+                .alpha = gv.alpha,
+                .hidden = @intCast(gv.vector.width),
+                .layers_total = @intCast(F.steer_layers),
+                .streams = @intCast(F.steer_streams),
+                .layers = layers,
+            }) catch |e| {
+                problem.* = try std.fmt.allocPrint(a, "--glp: the control vector does not fit this model ({s})", .{@errorName(e)});
+                return null;
+            };
+            S.set(plan);
+        }
+    }
     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
     if (o.record) |dir| if (try record.refusal(a, io, o.model_type, dir, taps)) |why| {
         problem.* = why;

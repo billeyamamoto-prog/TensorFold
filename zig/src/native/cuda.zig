@@ -335,10 +335,17 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             const layers = try a.alloc(S.Layer, gv.vector.layers.len);
             for (gv.vector.layers, 0..) |l, i| layers[i] = .{ .id = l.id, .dir = l.dir };
             const plan = try a.create(S.Plan);
+            // The vector spans the whole materialized hyper-connection row (streams x per-stream
+            // hidden: 4 x 2560 = 10240 for Flash Next), so the plan's per-stream width is the
+            // vector's width divided by the pass's own stream count - not the vector's width.
+            if (F.steer_streams == 0 or gv.vector.width % F.steer_streams != 0) {
+                problem.* = try std.fmt.allocPrint(a, "--glp: the vector's {d} wide directions do not divide the model's {d} hyper-connection streams", .{ gv.vector.width, F.steer_streams });
+                return null;
+            }
             plan.* = S.Plan.init(&g.driver, a, .{
                 .mode = if (gv.vector.mode == .add) S.Mode.add else S.Mode.project,
                 .alpha = gv.alpha,
-                .hidden = @intCast(gv.vector.width),
+                .hidden = @intCast(gv.vector.width / F.steer_streams),
                 .layers_total = @intCast(F.steer_layers),
                 .streams = @intCast(F.steer_streams),
                 .layers = layers,

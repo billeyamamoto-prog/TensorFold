@@ -58,7 +58,7 @@ pub const Plan = struct {
             for (dirs) |dd| if (dd) |v| a.free(v);
             a.free(dirs);
         }
-        const module = cuda.Module.load(d, cuda.kernels.flashnext_glp) catch |e| switch (e) {
+        var module = cuda.Module.load(d, cuda.kernels.flashnext_glp) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Cuda,
         };

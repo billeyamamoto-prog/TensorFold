@@ -18,6 +18,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 - Qwen3.8-27B on Metal gains a host GGUF family adapter for metadata, tensor names and exact affine preparation; GGUF serving remains unavailable (#1920).
 - Qwen3.8-27B on Metal gains a host GGUF family adapter for metadata, tensor names and exact affine preparation, with the observed qwen35 schema and effective norm gains pinned in host tests; GGUF serving remains unavailable (#1920).
 - Qwen3.8-27B on Metal serves Q4_K_M and Q8_0 GGUF files using their metadata, tokenizer and chat template, exact FP32 affine tables and an explicit DeltaNet head-layout conversion (#1920).
+- Qwen3.8-27B on Metal serves Q4_K_M and Q8_0 GGUF files using their metadata, full stop set, tokenizer and chat template, exact FP32 affine tables and an explicit DeltaNet head-layout conversion; the text path matches the MLX assets on 834 varied strings (#1920).
 
 - Living Weights on Qwen4 dense, step 1: the QSA backward pass on the host, checked against a binary64 reference; nothing served changes (#2021, part of #1804).
 

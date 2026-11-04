@@ -84,6 +84,11 @@ pub const reduce_symbols = [2][:0]const u8{
     "_ZN7tf_qmmf13reduce_kernelILb1EEEvPKfPvxif",
 };
 const row_tiles = [_]u32{ 16, 32, 64 };
+/// The prompt tile's dynamic shared bytes: 3 stages of 128 input rows (16 KiB), 128 weight columns (8 KiB) and their scales.
+const prompt_mx_stage: u32 = (128 * 128 + 128 * group + 128 * 2 + 127) / 128 * 128;
+const prompt_mx_shared: u32 = 3 * prompt_mx_stage;
+/// The two-stage, two-blocks-an-SM variant (mx2_tile): both blocks fit an SM shared memory.
+const prompt_mx2_shared: u32 = 2 * prompt_mx_stage;
 
 /// What a call writes: bf16 rows, or the fp32 sums unrounded (a tensor-parallel rank's partial rows).
 pub const Out = enum { bf16, f32 };
@@ -100,8 +105,16 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
     return set;
 }
 
+/// Narrowest MXFP8 projection the 128 x 128 prompt tile (qmmf.cu prompt_mx_body) takes in a prompt pass; 0: none.
+/// The choice is by the weight's width alone, so a row's bits never depend on the chunk it is in.
+pub var prompt_mx_min_n: usize = 1024;
+/// TF_FLASHNEXT_PROMPT_GEMM2=1: the prompt tile runs with two stages and two blocks an SM (same arithmetic, same bits).
+pub var mx2_tile: bool = false;
+
 pub const Lane = struct {
     mod: Module,
+    prompt_mx: [2]Function = undefined, // by Out: the relaxed MXFP8 prompt tile (a lane built by hand never launches it)
+    prompt_mx2: [2]Function = undefined, // by Out: the same tile, two stages, two blocks an SM (mx2_tile)
     fns: [modes.len][7]Function, // per mode: lane16, lane16c, lane32, lane32c, lane64, lane64c, fused
     f32_fns: [modes.len][7]Function,
     reduce: [2]Function, // by Out
@@ -116,8 +129,17 @@ pub const Lane = struct {
             .fns = undefined,
             .f32_fns = undefined,
             .reduce = undefined,
+            .prompt_mx = undefined,
             .clusters = capability_major >= 9,
         };
+        for (&l.prompt_mx, [_][:0]const u8{ "tf_qmmf_prompt_mx_bf16", "tf_qmmf_prompt_mx_f32" }) |*f, name| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(prompt_mx_shared);
+        }
+        for (&l.prompt_mx2, [_][:0]const u8{ "tf_qmmf_prompt_mx2_bf16", "tf_qmmf_prompt_mx2_f32" }) |*f, name| {
+            f.* = try mod.function(name);
+            try f.allowDynamicShared(prompt_mx2_shared);
+        }
         inline for (modes, 0..) |mode, mi| {
             l.fns[mi] = try loadTiles(mod, mode, false);
             l.f32_fns[mi] = try loadTiles(mod, mode, true);
@@ -144,6 +166,31 @@ pub const Lane = struct {
     /// Preserve FP32 outputs for a later residual or tensor-rank sum.
     pub fn matmulF32(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, part: u64) !void {
         return l.matmulOut(s, x, ldx, m, w, y, .f32, part);
+    }
+
+    /// matmulOut for rows of a prompt pass: MXFP8 weights of `prompt_mx_min_n` columns or more take the 128 x 128 tile
+    /// whose block scales ride in the B fragment (one fp32 chain over K); everything else is matmulOut.
+    pub fn matmulPrompt(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+        if (prompt_mx_min_n == 0 or w.mode != .mxfp8 or w.n < prompt_mx_min_n) return l.matmulOut(s, x, ldx, m, w, y, out, part);
+        const rows_t = (m + 127) / 128;
+        const band = @max(1, @min(rows_t, (12 << 20) / (128 * @as(usize, w.k) * 2)));
+        var args: launch_.Args = .{};
+        args.add(x);
+        args.add(w.codes);
+        args.add(w.scales);
+        args.add(w.scale);
+        args.add(y);
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(w.n)));
+        args.add(@as(i32, @intCast(w.k)));
+        args.add(@as(i32, @intCast(w.npad)));
+        args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
+        args.add(@as(i32, @intCast(band)));
+        try launch_.launch((if (mx2_tile) l.prompt_mx2 else l.prompt_mx)[@backingInt(out)], .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + 127) / 128)), .y = 1, .z = 1 },
+            .block = .{ .x = 256, .y = 1, .z = 1 },
+            .shared = if (mx2_tile) prompt_mx2_shared else prompt_mx_shared,
+        }, s, &args);
     }
 
     /// matmul() writing y as `out` says: bf16, or fp32.
@@ -259,4 +306,9 @@ test "instance names are qmmf.cu's" {
     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi3ELi16ELi64ELi1ELi4ELi4ELb0ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.fp8g, 16, true, false, false));
     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi0ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.fp4, 64, false, true, false));
     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi0ELi32ELi64ELi1ELi4ELi4ELb1ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.fp4, 32, true, false, true));
+}
+
+test "the two-stage prompt tile fits two blocks in an SM" {
+    try std.testing.expectEqual(@as(u32, 74496), prompt_mx_shared);
+    try std.testing.expectEqual(@as(u32, 49664), prompt_mx2_shared);
 }

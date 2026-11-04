@@ -30,9 +30,12 @@ fn cdiv(a: usize, b: usize) usize {
 const Fns = struct {
     wb0: cuda.Function,
     wb_moe: cuda.Function,
+    wb_moe_sh: cuda.Function,
     wb_slices: cuda.Function,
     normalize: cuda.Function,
     dense_mix: cuda.Function,
+    normalize2: cuda.Function,
+    dense_mix2: cuda.Function,
     shared_swiglu: cuda.Function,
     shared_scatter: cuda.Function,
     down: cuda.Function,
@@ -56,6 +59,11 @@ const Fns = struct {
     chunks_one: cuda.Function,
     fused: cuda.Function,
     merge: cuda.Function,
+    // --kv-cache fp8 (cuda_kv.zig): the same launches over e4m3 rows
+    prep_kv8: cuda.Function,
+    prep_media_kv8: cuda.Function,
+    chunks_kv8: cuda.Function,
+    fused_kv8: cuda.Function,
 };
 
 /// The captured entry points our glue replaces, by Triton name (TF_FLASHNEXT_OWNED lists them).
@@ -106,9 +114,12 @@ pub const Glue = struct {
         g.f = .{
             .wb0 = try g.hc.function("fn_hc_writeback0"),
             .wb_moe = try g.hc.function("fn_hc_writeback_moe"),
+            .wb_moe_sh = try g.hc.function("fn_hc_writeback_moe_sh"),
             .wb_slices = try g.hc.function("fn_hc_writeback_slices"),
             .normalize = try g.hc.function("fn_hc_normalize"),
             .dense_mix = try g.hc.function("fn_hc_dense_mix"),
+            .normalize2 = try g.hc.function("fn_hc_normalize2"),
+            .dense_mix2 = try g.hc.function("fn_hc_dense_mix2"),
             .shared_swiglu = try g.hc.function("fn_shared_swiglu"),
             .shared_scatter = try g.hc.function("fn_shared_scatter"),
             .down = try g.hc.function("fn_hc_down"),
@@ -132,11 +143,17 @@ pub const Glue = struct {
             .chunks_one = try g.attn.function("fn_attn_chunks_one"),
             .fused = try g.attn.function("fn_attn_fused"),
             .merge = try g.attn.function("fn_attn_merge"),
+            .prep_kv8 = try g.attn.function("fn_attn_prep_kv8"),
+            .prep_media_kv8 = try g.attn.function("fn_attn_prep_media_kv8"),
+            .chunks_kv8 = try g.attn.function("fn_attn_chunks_kv8"),
+            .fused_kv8 = try g.attn.function("fn_attn_fused_kv8"),
         };
         try g.f.chunks.allowDynamicShared(chunkSmem(1));
         try g.f.chunks_ahead.allowDynamicShared(chunkSmem(2));
         try g.f.chunks_one.allowDynamicShared(oneSmem());
         try g.f.fused.allowDynamicShared(oneSmem());
+        try g.f.chunks_kv8.allowDynamicShared(oneSmem());
+        try g.f.fused_kv8.allowDynamicShared(oneSmem());
         return g;
     }
 
@@ -194,16 +211,36 @@ pub const Glue = struct {
 
     /// Text positions, a bf16 cache: the model's heads (cuda_prompt_wt.zig) normed, roped and stored.
     pub fn attnPrep(g: *const Glue, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
+        return prepOn(g.f.prep, s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows);
+    }
+
+    /// attnPrep into fp8 caches (cuda_kv.zig): kc [cap, kv_heads, 272] and vc [cap, kv_heads, 256] bytes, each KV head's
+    /// key and value row quantized with its own power-of-two scales by the head's program.
+    pub fn attnPrepKv8(g: *const Glue, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
+        return prepOn(g.f.prep_kv8, s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows);
+    }
+
+    fn prepOn(f: cuda.Function, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize) !void {
         if (wt.head_dim != tile_head_dim) return error.RowShape;
         var a: cuda.Args = .{};
         ptrs(&a, &.{ proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc });
         a.add(eps);
         ints(&a, &.{ wt.proj_n, wt.q_heads, wt.kv_heads, wt.index_heads, wt.index_dim, wt.half });
-        try go(g.f.prep, s, .{ rows, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1 }, tile_head_dim, 0, &a);
+        try go(f, s, .{ rows, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1 }, tile_head_dim, 0, &a);
     }
 
     /// Attention over 512-key chunks; `qsa` the sparse form (NCH 5, rows' key lists), else dense (NCH 3).
     pub fn attnChunks(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize, chunks: usize, qsa: bool) !void {
+        const ahead = rows <= ahead_rows;
+        return chunksOn(if (ahead) g.f.chunks_ahead else g.f.chunks_one, if (ahead) chunkSmem(2) else oneSmem(), s, q, kc, vc, pos, po, pm, pl, ids, nk, sparse, rows, kv, chunks, qsa);
+    }
+
+    /// attnChunks over fp8 caches: one buffer a tile whatever the rows (the codes are widened as they are staged).
+    pub fn attnChunksKv8(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize, chunks: usize, qsa: bool) !void {
+        return chunksOn(g.f.chunks_kv8, oneSmem(), s, q, kc, vc, pos, po, pm, pl, ids, nk, sparse, rows, kv, chunks, qsa);
+    }
+
+    fn chunksOn(f: cuda.Function, shared: u32, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize, chunks: usize, qsa: bool) !void {
         const group = wt.q_heads / kv;
         if (group > tile_heads) return error.RowShape;
         var a: cuda.Args = .{};
@@ -211,12 +248,20 @@ pub const Glue = struct {
         ints(&a, &.{ wt.q_heads, kv, group, 512, if (qsa) wt.nch else wt.dense_nch });
         a.add(@as(f32, 0.0625));
         ints(&a, &.{ wt.index_idw, @intFromBool(qsa) });
-        const ahead = rows <= ahead_rows;
-        try go(if (ahead) g.f.chunks_ahead else g.f.chunks_one, s, .{ rows, kv, chunks }, 128, if (ahead) chunkSmem(2) else oneSmem(), &a);
+        try go(f, s, .{ rows, kv, chunks }, 128, shared, &a);
     }
 
     /// Prompt rows' attention with every chunk merged in the program (fn_attn_fused): out bf16, attnChunks then
     pub fn attnFused(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize) !void {
+        return fusedOn(g.f.fused, s, q, kc, vc, pos, out, ids, nk, sparse, rows, kv);
+    }
+
+    /// attnFused over fp8 caches.
+    pub fn attnFusedKv8(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize) !void {
+        return fusedOn(g.f.fused_kv8, s, q, kc, vc, pos, out, ids, nk, sparse, rows, kv);
+    }
+
+    fn fusedOn(f: cuda.Function, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize) !void {
         const group = wt.q_heads / kv;
         if (group > tile_heads) return error.RowShape;
         var a: cuda.Args = .{};
@@ -224,7 +269,7 @@ pub const Glue = struct {
         ints(&a, &.{ wt.q_heads, kv, group, 512 });
         a.add(@as(f32, 0.0625));
         ints(&a, &.{ wt.index_idw, 1 });
-        try go(g.f.fused, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);
+        try go(f, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);
     }
 
     pub fn attnMerge(g: *const Glue, s: cuda.Stream, po: u64, pm: u64, pl: u64, pos: u64, out: u64, nk: u64, sparse: u64, rows: usize, kv: usize, qsa: bool) !void {
@@ -261,6 +306,7 @@ pub const Glue = struct {
         args.add(eps);
         args.add(int(dims));
         args.add(int(streams));
+        if (dims % 256 == 0) return cuda.launch.launch(g.f.normalize2, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(streams) }, .block = .{ .x = 128 } }, s, &args);
         try cuda.launch.launch(g.f.normalize, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(streams) }, .block = .{ .x = 256 } }, s, &args);
     }
 
@@ -269,6 +315,7 @@ pub const Glue = struct {
         for ([_]u64{ up, norm, mixed, sums }) |v| args.add(v);
         args.add(int(dims));
         args.add(int(streams));
+        if (dims % 256 == 0) return cuda.launch.launch(g.f.dense_mix2, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(dims / 256) }, .block = .{ .x = 128 } }, s, &args);
         try cuda.launch.launch(g.f.dense_mix, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(dims / 32) }, .block = .{ .x = 32 } }, s, &args);
     }
 
@@ -363,6 +410,12 @@ pub const Glue = struct {
                 ptrs(&a, &.{ h, hout, pss, inj, y, wts });
                 ints(&a, &.{ dims, streams, topk, slots });
                 try go(g.f.wb_moe, s, grid, 256, 0, &a);
+            },
+            3 => {
+                // mode 2 with the shared expert's fp32 output (`branch`) as the last slot
+                ptrs(&a, &.{ h, hout, pss, inj, y, wts, branch });
+                ints(&a, &.{ dims, streams, topk, slots });
+                try go(g.f.wb_moe_sh, s, grid, 256, 0, &a);
             },
             4 => {
                 ptrs(&a, &.{ h, hout, pss, branch, inj });

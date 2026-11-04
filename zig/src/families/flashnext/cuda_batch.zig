@@ -11,6 +11,8 @@ const parts = @import("cuda_batch_state.zig");
 const batch_lanes = @import("cuda_batch_lanes.zig");
 const tiles = @import("cuda_tiles.zig");
 const tk = @import("cuda_tile_kernels.zig");
+const knobs = @import("cuda_knobs.zig");
+const side_ = @import("cuda_batch_side.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -89,6 +91,15 @@ fn profile() bool {
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
+/// TF_FLASHNEXT_GATHER_LOG=1: what a shared pass waits for the n-gram gather at the PLE layer.
+const GatherStat = struct {
+    var passes: u64 = 0;
+    var wait_ns: u64 = 0;
+    var gather_ns: u64 = 0;
+    var ahead_ns: u64 = 0;
+    var rows: u64 = 0;
+};
+
 pub fn Pass(comptime Tri: type) type {
     return struct {
         const Self = @This();
@@ -113,12 +124,16 @@ pub fn Pass(comptime Tri: type) type {
         prepared: bool = false,
         /// The pending write-back's branch sits in fp32 in moe_f32 (something added to it, or it is kept).
         pending_f32: bool = false,
+        /// Prompt rows (not a decode round, a drafted window or a training pass): the projections may take the relaxed prompt tiles.
+        prompt: bool = false,
+        /// The pending MoE write-back reads the shared expert's output from s.shared_out (never scattered into y's last slot).
+        shared_direct: bool = false,
 
         // ---- launches ----------------------------------------------------------------------------------------
 
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.prompt);
         }
 
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
@@ -194,6 +209,11 @@ pub fn Pass(comptime Tri: type) type {
             }
             const y = s.y + r0 * slots * dims * 4;
             const wts = s.wts + r0 * slots * 4;
+            if (self.shared_direct) {
+                self.shared_direct = false;
+                try self.tri.hcWriteback(h, h, pss, s.shared_out + r0 * dims * 4, "*fp32", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 3, 10, 11, 1);
+                return;
+            }
             try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
         }
 
@@ -218,6 +238,7 @@ pub fn Pass(comptime Tri: type) type {
             const xs_act = s.xs_act + r0 * (low / 32) * 4;
             if (hc_w.down.native) |down| {
                 const up = hc_w.up.native orelse return error.UnexpectedTensor;
+                if (self.prompt and n >= knobs.hc2MinRows() and knobs.promptHc2() and tiles.nativeFused(hc_w) and std.meta.eql(keep, HcKeep{})) return tiles.readoutNative(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
                 try self.k.native_lane.matmulF32(self.stream, norm, wide, n, down, s.hc_part, s.native_part);
                 const inj_ptr = if (hc_w.has_inj == 1) inj else act;
@@ -275,8 +296,13 @@ pub fn Pass(comptime Tri: type) type {
                 try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
             }
             // every row's conv, norms and gates, the recurrence, then the gated norm: the one-block chain's bits
-            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on();
-            if (fused) {
+            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on() and keep.log_k == 0;
+            if (keep.log_k != 0 and self.lanes.len == 0) {
+                // the window's rows go after the rows its log holds, which the chain takes first (TF_FLASHNEXT_KEEP_LATE)
+                const np: usize = if (self.hooks.keep) |kp| kp.pend else 0;
+                try self.gdnFrontLogged(lw, keep, np, s.proj, self.seq.conv[li].ptr, n, s.gq);
+                try self.gdnChainLate(s.gq, keep, np, self.seq.state[li].ptr, keep.state_out, n, s.ys);
+            } else if (fused) {
                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
                 const st = self.seq.state[li].ptr;
                 const in: gdn_fused.In = .{ .proj = s.proj, .conv = self.seq.conv[li].ptr, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = st, .state_out = if (keep.state_out != 0) keep.state_out else st, .norm = lw.norm.ptr };
@@ -284,6 +310,8 @@ pub fn Pass(comptime Tri: type) type {
             } else if (self.lanes.len == 0) {
                 try self.gdnFront(lw, s.proj, self.seq.conv[li].ptr, n, s.gq, s.gk, s.gv, s.ggb);
                 try self.gdnChain(s.gq, s.gk, s.gv, s.ggb, self.seq.state[li].ptr, keep.state_out, n, s.ys);
+            } else if (try self.gdnLanesBatched(lw, layer, li)) {
+                // every lane's rows in three launches (TF_FLASHNEXT_GDN_LANES)
             } else {
                 // shared rounds: each lane's rows kept, fronted and chained on its own conv window and state
                 var row0: usize = 0;
@@ -295,8 +323,14 @@ pub fn Pass(comptime Tri: type) type {
                     const gb = row0 * gdn.nv * 2 * 4;
                     try self.copy(lk.proj, proj, l.rows * gdn.proj_width * 2);
                     try self.copy(lk.hist, l.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
-                    try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
-                    try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    if (lk.log_k != 0) {
+                        const np: usize = if (l.keep) |kp| kp.pend else 0;
+                        try self.gdnFrontLogged(lw, lk, np, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk);
+                        try self.gdnChainLate(s.gq + qk, lk, np, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    } else {
+                        try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
+                        try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
+                    }
                     // the lane's conv window moves on now: the gated norm below reads none of it
                     try self.shiftWindow(l.seq.conv[li].ptr, proj, gdn.proj_width, l.rows, gdn.taps - 1, gdn.conv_dim);
                     row0 += l.rows;
@@ -305,6 +339,62 @@ pub fn Pass(comptime Tri: type) type {
             if (!fused) try gdn_fused.norm(self.k.gnorm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, s.gxs, n);
             if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, gdn.proj_width, n, gdn.taps - 1, gdn.conv_dim);
             self.out_slices = try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
+        }
+
+        /// A shared round's DeltaNet layer for all lanes at once when every lane logs its rows (TF_FLASHNEXT_GDN_LANES): the copies
+        /// of the projection rows and the conv history, the front, the late chain and the window shift as three launches. False
+        /// (nothing queued) when a lane does not log or there are more lanes than a launch takes.
+        fn gdnLanesBatched(self: *Self, lw: *const Layer, layer: usize, li: usize) !bool {
+            if (!knobs.gdnLanes() or self.lanes.len > gdn.lanes_max) return false;
+            const s = self.s;
+            for (self.lanes) |l| {
+                const kp = l.keep orelse return false;
+                const lk = kp.layers[layer];
+                if (lk.log_k == 0 or lk.log_v == 0 or lk.log_gb == 0 or lk.proj % 4 != 0) return false;
+            }
+            var tab: gdn.Lanes = std.mem.zeroes(gdn.Lanes);
+            var row0: usize = 0;
+            var max_rows: usize = 0;
+            for (self.lanes, 0..) |l, i| {
+                const kp = l.keep.?;
+                const lk = kp.layers[layer];
+                const st = l.seq.state[li].ptr;
+                tab.lane[i] = .{
+                    .proj = s.proj + row0 * gdn.proj_width * 2,
+                    .conv = l.seq.conv[li].ptr,
+                    .proj_save = lk.proj,
+                    .hist_save = lk.hist,
+                    .qn = s.gq + row0 * gdn.nk * gdn.dk * 4,
+                    .log_k = lk.log_k,
+                    .log_v = lk.log_v,
+                    .log_gb = lk.log_gb,
+                    .state_in = st,
+                    .state_out = if (lk.state_out != 0) lk.state_out else st,
+                    .ys = s.ys + row0 * gdn.value_dim * 4,
+                    .rows = cint(l.rows),
+                    .np = cint(kp.pend),
+                };
+                max_rows = @max(max_rows, l.rows);
+                row0 += l.rows;
+            }
+            tab.count = cint(self.lanes.len);
+            tab.max_rows = cint(max_rows);
+            const z: u32 = @intCast(self.lanes.len);
+            var f: cuda.Args = .{};
+            f.add(tab);
+            f.add(lw.cw.ptr);
+            f.add(lw.a_log.ptr);
+            f.add(lw.dt.ptr);
+            try cuda.launch.launch(self.k.front_lanes, .{ .grid = .{ .x = @intCast(max_rows), .y = gdn.nk + gdn.nv, .z = z }, .block = .{ .x = 256 } }, self.stream, &f);
+            var a: cuda.Args = .{};
+            a.add(tab);
+            try cuda.launch.launch(self.k.chain_lanes, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16, .z = z }, .block = .{ .x = 128 } }, self.stream, &a);
+            var h: cuda.Args = .{};
+            h.add(tab);
+            h.add(cint(gdn.taps - 1));
+            h.add(cint(gdn.conv_dim));
+            try cuda.launch.launch(self.k.shift_lanes, .{ .grid = .{ .x = @intCast(cdiv(gdn.conv_dim, 256)), .y = z }, .block = .{ .x = 256 } }, self.stream, &h);
+            return true;
         }
 
         /// fn_gdn_front over `rows` projection rows after the conv window `conv`.
@@ -320,6 +410,26 @@ pub fn Pass(comptime Tri: type) type {
             f.add(gv);
             f.add(ggb);
             try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(rows), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
+        }
+
+        /// fn_gdn_front over `rows` rows whose k, v and gates go to the layer's log after its first `np` rows, q to `qn`.
+        fn gdnFrontLogged(self: *Self, lw: *const Layer, lk: LayerKeep, np: usize, proj: u64, conv: u64, rows: usize, qn: u64) !void {
+            try self.gdnFront(lw, proj, conv, rows, qn, lk.log_k + np * gdn.log_row_k, lk.log_v + np * gdn.log_row_v, lk.log_gb + np * gdn.log_row_gb);
+        }
+
+        /// fn_gdn_rows_late over `rows` rows (q from `qn`) after the log's first `np`, from `state` to `state_out` (0: in place).
+        fn gdnChainLate(self: *Self, qn: u64, lk: LayerKeep, np: usize, state: u64, state_out: u64, rows: usize, ys: u64) !void {
+            var a: cuda.Args = .{};
+            a.add(qn);
+            a.add(lk.log_k);
+            a.add(lk.log_v);
+            a.add(lk.log_gb);
+            a.add(state);
+            a.add(if (state_out != 0) state_out else state);
+            a.add(cint(rows));
+            a.add(ys);
+            a.add(cint(np));
+            try cuda.launch.launch(self.k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
         }
 
         /// fn_gdn_rows over `rows` rows from `state`, in place or (state_out) to fn_gdn_rows_to's; readouts into ys.
@@ -389,7 +499,13 @@ pub fn Pass(comptime Tri: type) type {
             const vc = self.seq.vc[ai].ptr;
             const ikc = self.seq.ikc[ai].ptr;
             const pooled = self.seq.pooled[ai].ptr;
-            if (self.seq.media) |m| try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n) else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0);
+            // --kv-cache fp8: the same writes into e4m3 rows (cuda_kv.zig); the reads below take the matching kernels
+            const fp8 = self.seq.kv == .fp8;
+            if (self.seq.media) |m| {
+                if (fp8) try m.attnKv8(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n) else try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n);
+            } else if (fp8) {
+                try self.tri.attnPrepKv8(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n);
+            } else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0);
             // attention.qsa_pool for the blocks these rows complete, then each block of rows' scores and attention
             if (self.seq.media) |m| try m.pooled(self.stream, ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n) else try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n);
             const nb = scoreStride(self.seq.cap);
@@ -422,11 +538,17 @@ pub fn Pass(comptime Tri: type) type {
                     try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
                     if (!fused) {
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
-                        try self.tri.attnChunks(at.q + r0 * q_heads * head_dim * 2, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true);
+                        if (fp8) {
+                            try self.tri.attnChunksKv8(at.q + r0 * q_heads * head_dim * 2, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true);
+                        } else try self.tri.attnChunks(at.q + r0 * q_heads * head_dim * 2, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true);
                         try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * out_k * 2, s.qnk, s.qspr, m, kv_heads, true);
                     }
                 }
-                if (fused) try self.tri.attnFused(at.q + g0 * q_heads * head_dim * 2, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * out_k * 2, s.qids, s.qnk, s.qspr, gm, kv_heads);
+                if (fused) {
+                    if (fp8) {
+                        try self.tri.attnFusedKv8(at.q + g0 * q_heads * head_dim * 2, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * out_k * 2, s.qids, s.qnk, s.qspr, gm, kv_heads);
+                    } else try self.tri.attnFused(at.q + g0 * q_heads * head_dim * 2, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * out_k * 2, s.qids, s.qnk, s.qspr, gm, kv_heads);
+                }
             }
         }
 
@@ -435,11 +557,54 @@ pub fn Pass(comptime Tri: type) type {
             return self.moeBlockKeep(lw, .{});
         }
 
+        /// The native shared expert's three projections and SwiGLU, then its scatter into y's last slot (unless `direct`: the
+        /// next write-back reads the fp32 output where it lies), queued on `stream`.
+        fn sharedExpert(self: *Self, native: anytype, stream: cuda.Stream, direct: bool) !void {
+            const s = self.s;
+            const n = self.rows;
+            const glue = self.tri.own orelse return error.NativeGlueRequired;
+            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+            try glue.sharedSwiGLU(stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
+            try self.k.native_lane.matmulF32(stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
+            if (!direct) try glue.sharedScatter(stream, s.shared_out, s.y, n, dims, slots);
+        }
+
+        /// The side stream's NaN fill of what the shared expert writes (TF_FLASHNEXT_SHARED_SIDE_POISON=1).
+        fn poisonShared(self: *Self, stream: cuda.Stream) !void {
+            const s = self.s;
+            const n = self.rows;
+            const d = stream.d;
+            inline for (.{ .{ s.shared_gate, n * moe_w * 2 }, .{ s.shared_up, n * moe_w * 2 }, .{ s.shared_act, n * moe_w * 2 }, .{ s.shared_out, n * dims * 4 }, .{ s.native_part, 8 * n * dims * 4 } }) |b| {
+                try d.check(d.api.cuMemsetD8Async(b[0], 0xff, b[1], stream.handle), "cuMemsetD8Async");
+            }
+        }
+
         /// moeBlock, keeping its input, experts and weights.
         pub fn moeBlockKeep(self: *Self, lw: *const Layer, keep: LayerKeep) !void {
             const s = self.s;
             const n = self.rows;
             const pairs = n * slots;
+            // The shared expert reads the normalized rows (s.mixed) and nothing the router and routed experts write; its
+            // scratch is its own for the window and its y slot is outside theirs. On the side stream it starts at once.
+            // A prompt chunk that reads the shared output in place (shared_direct) stays on the compute stream.
+            var side: ?*const side_.Side = null;
+            errdefer if (side) |sd| sd.end(self.stream) catch {};
+            var direct = false;
+            if (lw.native_experts) |*native| {
+                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
+                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+                // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
+                direct = native.rank == 0 and self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1;
+                if (native.rank == 0 and !direct) {
+                    if (try side_.get(&s.side, self.stream.d)) |sd| if (sd.applies(self.prompt)) {
+                        try sd.begin(self.stream);
+                        side = sd;
+                        if (side_.poison()) try self.poisonShared(sd.stream);
+                        try self.sharedExpert(native, sd.stream, false);
+                    };
+                }
+            }
             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
             try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
@@ -448,19 +613,14 @@ pub fn Pass(comptime Tri: type) type {
             const e = experts_n + 1;
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
-                const owned = &native.experts;
-                try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
-                try self.k.router.route(self.stream, s.picks, pairs, e, 16, plan);
-                const items = cuda.grouped.maxItems(pairs, e, 16);
-                try self.k.nvfp4.run(self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, experts_n);
-                try self.k.nvfp4.run(self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, experts_n);
-                if (native.rank == 0) {
-                    const glue = self.tri.own orelse return error.NativeGlueRequired;
-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
-                    try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
-                    try self.k.native_lane.matmulF32(self.stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
-                    try glue.sharedScatter(self.stream, s.shared_out, s.y, n, dims, slots);
+                try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
+                if (side) |sd| {
+                    // behind the join nothing of the shared expert is in flight: s.y is whole and its scratch is free
+                    side = null;
+                    try sd.end(self.stream);
+                } else if (native.rank == 0) {
+                    try self.sharedExpert(native, self.stream, direct);
+                    if (direct) self.shared_direct = true;
                 }
                 if (native.world != 1) {
                     const collective = self.m.collective orelse return error.TensorParallelUnavailable;
@@ -520,6 +680,7 @@ pub fn Pass(comptime Tri: type) type {
             self.pos0 = pos0;
             self.pending = null;
             self.pending_f32 = false;
+            self.shared_direct = false;
             // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
             if (!self.prepared) try s.ready();
             const emb = s.hostEmb(n);
@@ -537,8 +698,35 @@ pub fn Pass(comptime Tri: type) type {
             for (self.m.layers, 0..) |*lw, layer| {
                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
                 if (layer == ple_layer) {
+                    const log_gather = thread != null and knobs.gatherLog();
+                    const t_join = if (log_gather) std.Io.Clock.awake.now(self.io).toNanoseconds() else 0;
                     if (thread) |th| th.join();
                     thread = null;
+                    if (log_gather) {
+                        const t_done = std.Io.Clock.awake.now(self.io).toNanoseconds();
+                        // a prompt chunk is rare enough to log by itself
+                        if (self.lanes.len == 0) {
+                            std.debug.print("gather: prompt chunk of {d} rows at {d}: gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ n, pos0, @as(f64, @floatFromInt(gather.ns)) / 1e6, @as(f64, @floatFromInt(t_join - t0)) / 1e6, @as(f64, @floatFromInt(t_done - t_join)) / 1e6 });
+                            if (self.m.ngram.reader) |rd| {
+                                const q = rd.take();
+                                std.debug.print("gather: prompt chunk rows: {d} cache hits ({d} after a wait), {d} read by the gather, {d} read ahead ({d} already there) of {d} asked\n", .{ q.hits, q.waited, q.own, q.ahead, q.skipped, q.rows });
+                            }
+                        } else {
+                            GatherStat.passes += 1;
+                            GatherStat.wait_ns += @intCast(t_done - t_join);
+                            GatherStat.gather_ns += @intCast(gather.ns);
+                            GatherStat.ahead_ns += @intCast(t_join - t0);
+                            GatherStat.rows += n;
+                            if (GatherStat.passes % 100 == 0) {
+                                const f = @as(f64, 1e6) * 100.0;
+                                std.debug.print("gather: {d} shared passes, per pass: {d:.1} rows, gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ GatherStat.passes, @as(f64, @floatFromInt(GatherStat.rows)) / 100.0, @as(f64, @floatFromInt(GatherStat.gather_ns)) / f, @as(f64, @floatFromInt(GatherStat.ahead_ns)) / f, @as(f64, @floatFromInt(GatherStat.wait_ns)) / f });
+                                GatherStat.wait_ns = 0;
+                                GatherStat.gather_ns = 0;
+                                GatherStat.ahead_ns = 0;
+                                GatherStat.rows = 0;
+                            }
+                        }
+                    }
                     if (gather.failed) |err| return err;
                     if (profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
                     try self.upload(s.ple_emb, std.mem.sliceAsBytes(emb));
@@ -585,7 +773,7 @@ pub fn Pass(comptime Tri: type) type {
     };
 }
 
-test "a pass's scratch at the dense cap stays near a gigabyte and a half" {
-    try std.testing.expect(Scratch.bytes(default_chunk) < 2 << 30);
+test "a pass's scratch at the default chunk stays under five gigabytes" {
+    try std.testing.expect(Scratch.bytes(default_chunk) < 5 << 30);
     try std.testing.expect(Scratch.bytes(1) < Scratch.bytes(2));
 }

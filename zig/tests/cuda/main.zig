@@ -26,6 +26,7 @@ const mxfp8_tests = @import("mxfp8_tests.zig");
 const projection_f32_tests = @import("projection_f32_tests.zig");
 const fp8_experts_tests = @import("fp8_experts_tests.zig");
 const nvfp4_experts_tests = @import("nvfp4_experts_tests.zig");
+const nvfp4_experts_tile_tests = @import("nvfp4_experts_tile_tests.zig");
 const quant_ref_tests = @import("quant_ref_tests.zig");
 const glm_ref_tests = @import("glm_ref_tests.zig");
 const affine8_tests = @import("affine8_tests.zig");
@@ -79,6 +80,7 @@ const flashnext_model_rank_tests = @import("flashnext_model_rank_tests.zig");
 const flashnext_fidelity_tests = @import("flashnext_fidelity_tests.zig");
 const flashnext_window_tests = @import("flashnext_window_tests.zig");
 const flashnext_windows_tests = @import("flashnext_windows_tests.zig");
+const flashnext_keep_late_tests = @import("flashnext_keep_late_tests.zig");
 const flashnext_mtp_parity_tests = @import("flashnext_mtp_parity_tests.zig");
 const flashnext_score_tests = @import("flashnext_score_tests.zig");
 const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
@@ -87,7 +89,10 @@ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
 const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
 const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
+const flashnext_hc_fuse_tests = @import("flashnext_hc_fuse_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
+const flashnext_kv8_tests = @import("flashnext_kv8_tests.zig");
+const flashnext_cand_tests = @import("flashnext_cand_tests.zig");
 const ggml_tests = @import("ggml_tests.zig");
 const paged_tests = @import("paged_tests.zig");
 
@@ -112,6 +117,7 @@ const usage =
     \\  flashnext-fidelity-rank MODEL RANK PORT FIXTURE OUTPUT  fixed-history full score rows
     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+    \\  flashnext-keep-late MODEL IDS_FILE  windows kept in part with TF_FLASHNEXT_KEEP_LATE's waiting rows against the replaying rollback, byte for byte
     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE  explicit full-model replay experiment (no drafts)
@@ -122,6 +128,8 @@ const usage =
     \\  flashnext-dense-hc        dense connection weights and FP32 normalization against FP64
     \\  flashnext-hc              Flash Next's own hyper-connection and n-gram glue against float64 (synthetic rows)
     \\  flashnext-attn            Flash Next's own attention glue, pooling and block scores against float64 (synthetic)
+    \\  flashnext-kv8             Flash Next's --kv-cache fp8 write against its format model and its reads against the bf16 kernels (synthetic)
+    \\  flashnext-cand            Flash Next's sampled-draw candidates (fn_row_cand) against the host reference (synthetic rows, ties, NaN)
     \\  info                      driver, device and library versions
     \\  smoke                     copies, fills, launches, argument packing, module globals
     \\  shared-context            Context.shared and Stream.borrowed as a library inside a host's process sees them
@@ -181,6 +189,8 @@ const usage =
     \\  fp8-lane <dir>            block-FP8 projections against the Python lane matmul's bytes (oracle/fp8_lane.py)
     \\  fp8-experts <dir>         grouped block-FP8 experts against recorded fixture bytes
     \\  nvfp4-experts <dir>       grouped NVFP4 experts against recorded fixture bytes
+    \\  nvfp4-experts-tile [ROWS[,ROWS] [EXPERTS [time]]]  the prompt expert tile against the decode kernel, byte for byte, and its time (synthetic)
+    \\  hc-fuse                   the fused native hyper-connection read-out against the five-launch chain: bytes, then times
     \\  projection-f32            FP32 projection outputs against FP64, rounding and row/reduction invariance
     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
@@ -285,6 +295,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single-serial")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), true);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-rank")) return flashnext_fidelity_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "flashnext-windows")) return flashnext_windows_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "flashnext-keep-late")) return flashnext_keep_late_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-mtp-parity")) return flashnext_mtp_parity_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-score")) return flashnext_score_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-window-rank")) return flashnext_window_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));
@@ -295,7 +306,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "hc-fuse")) return flashnext_hc_fuse_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "flashnext-kv8")) return flashnext_kv8_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "flashnext-cand")) return flashnext_cand_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
     if (std.mem.eql(u8, cmd, "shared-context")) return runtime_tests.sharedContext(gpu);
@@ -325,6 +339,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fp8-experts")) return fp8_experts_tests.experts(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "nvfp4")) return nvfp4_tests.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "nvfp4-experts")) return nvfp4_experts_tests.experts(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "nvfp4-experts-tile")) return nvfp4_experts_tile_tests.run(gpu, rest);
     if (std.mem.eql(u8, cmd, "projection-f32")) return projection_f32_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "mxfp8")) return mxfp8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);

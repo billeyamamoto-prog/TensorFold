@@ -3,6 +3,8 @@
 // glue.py and attention.py's arithmetic and bf16 rounding points; the attention dots on mma tiles, K ascending.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -53,6 +55,64 @@ __device__ __forceinline__ int partner(int d, int half) {
     return d < half ? d + half : (d < 2 * half ? d - half : d);
 }
 
+// --kv-cache fp8 (cuda_kv.zig): a position's KV head keeps its keys as a row of KS bytes, HD e4m3 codes then s_k and s_v
+// (fp32) and 8 zero bytes, and its values as a row of HD codes. A row's scale is 2^(ceil(log2 amax) - 8) from the bits of
+// its largest magnitude, so its largest code lies in (128, 256] and nothing saturates (e4m3 holds 448).
+constexpr int KS = HD + 16;
+
+// A block's largest value, whatever the order (fmaxf drops a NaN: the codes carry it).
+__device__ __forceinline__ float block_max(float v, float* scratch) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    const int warps = blockDim.x >> 5;
+    if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float m = scratch[0];
+    for (int w = 1; w < warps; ++w) m = fmaxf(m, scratch[w]);
+    __syncthreads();
+    return m;
+}
+
+// The scale's biased exponent, 1 to 254 (a zero row gets 2^-126): cuda_kv.zig scaleExponent. The scale is 2^(e - 127), its
+// reciprocal 2^(127 - e), the float with biased exponent 254 - e; both exact.
+__device__ __forceinline__ int kv8_exponent(float amax) {
+    const unsigned bits = __float_as_uint(amax);
+    const int e = static_cast<int>((bits >> 23) & 0xFFu) + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+    return min(max(e - 8, 1), 254);
+}
+
+// x (already times the reciprocal scale) to its e4m3 code: nearest, ties to even, saturating at 448 (cuda_kv.zig encode).
+__device__ __forceinline__ unsigned char kv8_code(float x) {
+    return static_cast<unsigned char>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
+}
+
+// A position's KV head: key k and value v (bf16 values as floats) of thread d of HD to codes, and the two scales (thread 0).
+__device__ __forceinline__ void kv8_store(unsigned char* __restrict__ KC, unsigned char* __restrict__ VC, long long slot, float k,
+                                          float v, float* scratch) {
+    const int d = threadIdx.x;
+    const int ek = kv8_exponent(block_max(fabsf(k), scratch));
+    const int ev = kv8_exponent(block_max(fabsf(v), scratch));
+    KC[slot * KS + d] = kv8_code(__fmul_rn(k, __uint_as_float(static_cast<unsigned>(254 - ek) << 23)));
+    VC[slot * HD + d] = kv8_code(__fmul_rn(v, __uint_as_float(static_cast<unsigned>(254 - ev) << 23)));
+    if (d == 0) *reinterpret_cast<uint4*>(KC + slot * KS + HD) = make_uint4(static_cast<unsigned>(ek) << 23, static_cast<unsigned>(ev) << 23, 0u, 0u);
+}
+
+// Eight e4m3 codes (two words of a row) times s as eight bf16 (one 16-byte store): every product is a bf16 value, so the
+// widening through half and fp32 is exact.
+__device__ __forceinline__ uint4 kv8_widen8(uint32_t w0, uint32_t w1, float s) {
+    const __nv_fp8x2_storage_t* p0 = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w0);
+    const __nv_fp8x2_storage_t* p1 = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w1);
+    uint4 r;
+    uint32_t* out = reinterpret_cast<uint32_t*>(&r);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(i < 2 ? p0[i] : p1[i - 2], __NV_E4M3)));
+        const __nv_bfloat162 b = __floats2bfloat162_rn(__fmul_rn(f.x, s), __fmul_rn(f.y, s));
+        out[i] = *reinterpret_cast<const uint32_t*>(&b);
+    }
+    return r;
+}
+
 }  // namespace fn_attn
 
 using namespace fn_attn;
@@ -64,6 +124,8 @@ __device__ __forceinline__ int media_pos(int pos, int d, int half, const int* ro
 }
 
 // glue._attn_prep (text positions, bf16 cache), program (row, head): heads normed, rounded, roped, rounded, stored.
+// KV8: the cache is cuda_kv.zig's fp8 rows (KC and VC are bytes there); the KV head's program quantizes its key and value.
+template <bool KV8 = false>
 __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
                                                                const float* __restrict__ QW, const float* __restrict__ KW,
                                                                const float* __restrict__ IW, const float* __restrict__ INV,
@@ -95,8 +157,13 @@ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restric
         Q[(static_cast<long long>(r) * NQ + head) * HD + d] = out;
     } else if (!index) {
         const long long slot = static_cast<long long>(pos) * NKV + head - NQ;
-        KC[slot * HD + d] = out;
-        VC[slot * HD + d] = P[row + NQ * 2 * HD + NKV * HD + (head - NQ) * HD + d];
+        const __nv_bfloat16 v = P[row + NQ * 2 * HD + NKV * HD + (head - NQ) * HD + d];
+        if constexpr (KV8) {
+            kv8_store(reinterpret_cast<unsigned char*>(KC), reinterpret_cast<unsigned char*>(VC), slot, bf(out), bf(v), scratch);
+        } else {
+            KC[slot * HD + d] = out;
+            VC[slot * HD + d] = v;
+        }
     } else {
         IQ[(static_cast<long long>(r) * NI + head - NQ - NKV) * IHD + d] = out;
     }
@@ -120,6 +187,27 @@ extern "C" __global__ void __launch_bounds__(256) fn_attn_prep_media(const __nv_
                                                                __nv_bfloat16* __restrict__ IKC, float eps, int PW, int NQ, int NKV,
                                                                int NI, int IHD, int HALF, const int* rope3, int n, int delta) {
     fn_attn_prep_body(P, POS0, QW, KW, IW, INV, Q, KC, VC, IQ, IKC, eps, PW, NQ, NKV, NI, IHD, HALF, rope3, n, delta);
+}
+
+// fn_attn_prep into fp8 caches: KC [cap, NKV, KS] and VC [cap, NKV, HD] bytes; the grid, block and other arguments as fn_attn_prep's.
+extern "C" __global__ void __launch_bounds__(256) fn_attn_prep_kv8(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
+                                                               const float* __restrict__ QW, const float* __restrict__ KW,
+                                                               const float* __restrict__ IW, const float* __restrict__ INV,
+                                                               __nv_bfloat16* __restrict__ Q, unsigned char* __restrict__ KC,
+                                                               unsigned char* __restrict__ VC, __nv_bfloat16* __restrict__ IQ,
+                                                               __nv_bfloat16* __restrict__ IKC, float eps, int PW, int NQ, int NKV,
+                                                               int NI, int IHD, int HALF) {
+    fn_attn_prep_body<true>(P, POS0, QW, KW, IW, INV, Q, reinterpret_cast<__nv_bfloat16*>(KC), reinterpret_cast<__nv_bfloat16*>(VC), IQ, IKC, eps, PW, NQ, NKV, NI, IHD, HALF, nullptr, 0, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_attn_prep_media_kv8(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
+                                                               const float* __restrict__ QW, const float* __restrict__ KW,
+                                                               const float* __restrict__ IW, const float* __restrict__ INV,
+                                                               __nv_bfloat16* __restrict__ Q, unsigned char* __restrict__ KC,
+                                                               unsigned char* __restrict__ VC, __nv_bfloat16* __restrict__ IQ,
+                                                               __nv_bfloat16* __restrict__ IKC, float eps, int PW, int NQ, int NKV,
+                                                               int NI, int IHD, int HALF, const int* rope3, int n, int delta) {
+    fn_attn_prep_body<true>(P, POS0, QW, KW, IW, INV, Q, reinterpret_cast<__nv_bfloat16*>(KC), reinterpret_cast<__nv_bfloat16*>(VC), IQ, IKC, eps, PW, NQ, NKV, NI, IHD, HALF, rope3, n, delta);
 }
 
 // glue._attn_gate, program (row, head) of HD threads: bf16(o / (1 + e^-gate)) and its 32-group sums.
@@ -205,12 +293,15 @@ extern "C" __global__ void __launch_bounds__(256) fn_qsa_scores(const __nv_bfloa
 }
 
 // attention._chunks, program (row, KV head, chunk): the chunk's keys TK at a time, online softmax, partial o, m, l.
-template <int NB, bool ONE = false, bool FUSE = false>
+// KV8 (ONE only): KC and VC are cuda_kv.zig's fp8 rows; a tile's codes are widened to bf16 (times each key's scale, exact)
+// into the same shared rows, so everything after the loads is the bf16 kernel's, on the dequantized keys and values.
+template <int NB, bool ONE = false, bool FUSE = false, bool KV8 = false>
 __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KC,
                                             const __nv_bfloat16* __restrict__ VC, const int* __restrict__ POS0,
                                             float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
                                             const int* __restrict__ IDS, const int* __restrict__ NKR, const int* __restrict__ SPR,
                                             int H, int HK, int G, int CH, int NCH, float SCALE, int IDW, int QSA) {
+    static_assert(!KV8 || ONE, "fp8 rows are staged one buffer at a time");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     typedef __nv_bfloat16 Row[HD + 8];
     Row* qs = reinterpret_cast<Row*>(smem_raw);                  // [QR] the row's query heads
@@ -218,7 +309,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
     // ONE: one [TK] buffer, the tile's keys and then, once the scores are taken, its values (fewer bytes, more blocks)
     __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NB * 2 * TK));
     __shared__ float red_m[4][QR], red_l[4][QR];
-    __shared__ int key_ids[NB][TK];
+    __shared__ int key_ids[KV8 ? 2 : NB][TK];
     const int r = blockIdx.x, hk = blockIdx.y, c = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     int n = POS0[0] + r + 1;
@@ -252,6 +343,44 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
             qmm_frag::commit();
         }
     };
+    // KV8: a thread's four 16-code items a tile and pass (blockDim 128: a tile is TK x HD / 16 items), their codes and the key's
+    // scale held in registers: the next tile's loads are issued before this tile's math, so their latency hides behind it. An
+    // absent key is zero codes, scale 0.
+    uint4 raw_k[4], raw_v[4];
+    float raw_sk[4], raw_sv[4];
+    auto fetch_kv8 = [&](int ids_buf, int pass) {
+        const unsigned char* kc = reinterpret_cast<const unsigned char*>(KC);
+        const unsigned char* vc = reinterpret_cast<const unsigned char*>(VC);
+#pragma unroll
+        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
+            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16), key = key_ids[ids_buf][k];
+            uint4 w = make_uint4(0u, 0u, 0u, 0u);
+            float sc = 0.0f;
+            if (key >= 0) {
+                const long long slot = static_cast<long long>(key) * HK + hk;
+                const unsigned char* krow = kc + slot * KS;
+                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * cc16);
+                sc = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
+            }
+            if (pass == 0) { raw_k[i] = w; raw_sk[i] = sc; } else { raw_v[i] = w; raw_sv[i] = sc; }
+        }
+    };
+    // the registers' tile widened into the one shared buffer (keys, pass 0, or values, pass 1)
+    auto widen_kv8 = [&](int pass) {
+#pragma unroll
+        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
+            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16);
+            const uint4 w = pass == 0 ? raw_k[i] : raw_v[i];
+            const float sc = pass == 0 ? raw_sk[i] : raw_sv[i];
+            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16]) = kv8_widen8(w.x, w.y, sc);
+            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16 + 8]) = kv8_widen8(w.z, w.w, sc);
+        }
+    };
+    // a tile's key ids (-1 past the context)
+    auto id_of = [&](int tile_t0, int k) {
+        const int ki = start + tile_t0 + k;
+        return ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
+    };
     // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
     auto load_one = [&](int pass) {
         const __nv_bfloat16* src = pass == 0 ? KC : VC;
@@ -268,10 +397,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
     float o[8][4] = {};
     const int tiles = min(n - start, CH);
     if (NB == 2) load(0, 0);
+    if constexpr (KV8) {                                   // the first tile's ids, then its codes into registers
+        if (threadIdx.x < TK) key_ids[0][threadIdx.x] = id_of(0, threadIdx.x);
+        __syncthreads();
+        fetch_kv8(0, 0);
+        fetch_kv8(0, 1);
+        qmm_frag::commit();                                // the group holding the queries' copies
+    }
     for (int t0 = 0, it = 0; t0 < tiles; t0 += TK, ++it) {
         const int buf = NB == 2 ? it & 1 : 0;
         const bool ahead = NB == 2 && t0 + TK < tiles;  // the next tile's loads go out before this tile's math
-        if constexpr (ONE) {
+        const bool more = t0 + TK < tiles;
+        if constexpr (KV8) {
+            // this tile's codes are in registers (issued an iteration ago): its keys widen into the buffer, the next tile's ids beside
+            const int next_id = more && threadIdx.x < TK ? id_of(t0 + TK, threadIdx.x) : -1;
+            widen_kv8(0);
+            if (more && threadIdx.x < TK) key_ids[(it & 1) ^ 1][threadIdx.x] = next_id;
+        } else if constexpr (ONE) {
             if (threadIdx.x < TK) {
                 const int ki = start + t0 + threadIdx.x;
                 key_ids[0][threadIdx.x] = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
@@ -284,10 +426,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
         }
         Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
         Row* vt = ONE ? kt : kt + TK;
-        const int* keys = key_ids[buf];
+        const int* keys = key_ids[KV8 ? (it & 1) : buf];
         if constexpr (ONE) qmm_frag::wait<0>();
         else if (ahead) qmm_frag::wait<3>(); else qmm_frag::wait<1>();
         __syncthreads();
+        if constexpr (KV8) {
+            if (more) fetch_kv8((it & 1) ^ 1, 0);           // the next tile's keys load during this tile's scores
+        }
         constexpr int JT = TK / 32;  // a warp's 8-key tiles
         float s[JT][4] = {};
 #pragma unroll 4
@@ -305,7 +450,12 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
         }
         if constexpr (ONE) {                              // every warp has read the keys: the values take their place
             __syncthreads();
-            load_one(1);
+            if constexpr (KV8) {
+                widen_kv8(1);
+                if (more) fetch_kv8((it & 1) ^ 1, 1);
+            } else {
+                load_one(1);
+            }
         }
         float tile_m[2] = {-INFINITY, -INFINITY};
 #pragma unroll
@@ -449,6 +599,27 @@ extern "C" __global__ void __launch_bounds__(128) fn_attn_chunks_one(const __nv_
                                                                      const int* __restrict__ SPR, int H, int HK, int G, int CH, int NCH,
                                                                      float SCALE, int IDW, int QSA) {
     attn_chunks<1, true>(Q, KC, VC, POS0, PO, PM, PL, IDS, NKR, SPR, H, HK, G, CH, NCH, SCALE, IDW, QSA);
+}
+
+// fn_attn_chunks_one over fp8 caches (cuda_kv.zig): KC [cap, HK, KS] and VC [cap, HK, HD] bytes; every other argument the same.
+extern "C" __global__ void __launch_bounds__(128) fn_attn_chunks_kv8(const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ KC,
+                                                                     const unsigned char* __restrict__ VC, const int* __restrict__ POS0,
+                                                                     float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
+                                                                     const int* __restrict__ IDS, const int* __restrict__ NKR,
+                                                                     const int* __restrict__ SPR, int H, int HK, int G, int CH, int NCH,
+                                                                     float SCALE, int IDW, int QSA) {
+    attn_chunks<1, true, false, true>(Q, reinterpret_cast<const __nv_bfloat16*>(KC), reinterpret_cast<const __nv_bfloat16*>(VC), POS0, PO, PM, PL,
+                                      IDS, NKR, SPR, H, HK, G, CH, NCH, SCALE, IDW, QSA);
+}
+
+// fn_attn_fused over fp8 caches.
+extern "C" __global__ void __launch_bounds__(128) fn_attn_fused_kv8(const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ KC,
+                                                                    const unsigned char* __restrict__ VC, const int* __restrict__ POS0,
+                                                                    float* __restrict__ OUT, const int* __restrict__ IDS, const int* __restrict__ NKR,
+                                                                    const int* __restrict__ SPR, int H, int HK, int G, int CH,
+                                                                    float SCALE, int IDW, int QSA) {
+    attn_chunks<1, true, true, true>(Q, reinterpret_cast<const __nv_bfloat16*>(KC), reinterpret_cast<const __nv_bfloat16*>(VC), POS0, OUT, nullptr,
+                                     nullptr, IDS, NKR, SPR, H, HK, G, CH, 1, SCALE, IDW, QSA);
 }
 
 // attn_chunks with the next tile's loads in flight (a decode round's few rows): the same sums.

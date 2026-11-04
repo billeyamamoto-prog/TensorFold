@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const gdn = @import("cuda_gdn.zig");
 const ple = @import("cuda_ple.zig");
+const knobs = @import("cuda_knobs.zig");
 const wt = @import("cuda_prompt_wt.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
@@ -49,7 +50,7 @@ pub const pocket_stride: usize = 128;
 /// Prompt rows one fused attention launch takes (their selections staged att_rows at a time).
 pub const fused_rows: usize = 1024;
 /// Rows a pass holds at most unless asked for more.
-pub const default_chunk: usize = 1536;
+pub const default_chunk: usize = 3072;
 /// The most rows TF_FLASHNEXT_CHUNK may ask for (the largest measured pass; its scratch is about 13 GiB more).
 pub const max_chunk: usize = 16384;
 const ratio = wt.index_ratio;
@@ -88,6 +89,11 @@ pub const LayerKeep = struct {
     hist: u64 = 0,
     /// The chain's end state goes here, the sequence's own left as before the chunk; 0: in place.
     state_out: u64 = 0,
+    /// DeltaNet with TF_FLASHNEXT_KEEP_LATE: the lane's log of rows [rows, ...] as the front leaves them (k [rows, 16, 128], v and
+    /// the decay and beta gates [rows, 48, 128 | 2], fp32); the window's rows go after the Keep's `pend` rows already waiting there.
+    log_k: u64 = 0,
+    log_v: u64 = 0,
+    log_gb: u64 = 0,
     attn_hc: HcKeep = .{},
     mlp_hc: HcKeep = .{},
     /// The mixer's and the MoE's branches [rows, dims] bf16 as the write-backs add them (the MoE's with its pocket).
@@ -108,6 +114,8 @@ pub const LayerKeep = struct {
 pub const Keep = struct {
     layers: [layers_n]LayerKeep = @splat(.{}),
     mixer: HcKeep = .{},
+    /// Rows of earlier windows kept but not yet taken by the DeltaNet states (the logs' first rows): this pass's chain takes them first.
+    pend: u32 = 0,
 };
 
 /// A sequence of a training pass (Pass.spans): its first row and its rows.
@@ -155,9 +163,20 @@ pub const Kernels = struct {
     tiles: tk.TileKernels,
     native_lane: cuda.qmmf.Lane,
     nvfp4: cuda.experts.Nvfp4Experts,
+    /// Prompt chunks' routed NVFP4 experts on shared-memory row tiles, the decode kernel's bits; null: not taken.
+    expert_tile: ?cuda.nvfp4_tile.Tile,
     front: cuda.Function,
     chain: cuda.Function,
     chain_to: cuda.Function,
+    /// fn_gdn_rows_to after the rows a log holds (TF_FLASHNEXT_KEEP_LATE).
+    chain_late: cuda.Function,
+    /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
+    conv_roll: cuda.Function,
+    /// The three launches a lane-batched shared round takes a DeltaNet layer (TF_FLASHNEXT_GDN_LANES): front with the projection
+    /// copy, the late chain, the history copy with the window shift, each for every lane.
+    front_lanes: cuda.Function,
+    chain_lanes: cuda.Function,
+    shift_lanes: cuda.Function,
     chain_tpr: cuda.Function,
     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
     gdn_fused: cuda.Function,
@@ -169,7 +188,7 @@ pub const Kernels = struct {
     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
     select: cuda.Function,
 
-    pub fn load(d: *const cuda.Driver) !Kernels {
+    pub fn load(d: *const cuda.Driver, tile_cfg: cuda.nvfp4_tile.Config) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
@@ -194,6 +213,9 @@ pub const Kernels = struct {
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, device), "cuDeviceGetAttribute");
         k.nvfp4 = try cuda.experts.Nvfp4Experts.load(d, @intCast(sms));
         errdefer k.nvfp4.unload();
+        k.expert_tile = if (tile_cfg.mode == .off) null else try cuda.nvfp4_tile.Tile.load(d, @intCast(sms), tile_cfg);
+        errdefer if (k.expert_tile) |*t| t.unload();
+        std.log.info("flashnext: prompt experts on shared-memory row tiles: {s}, {d} pairs an item, from {d} rows", .{ @tagName(tile_cfg.mode), tile_cfg.pairs, tile_cfg.min_rows });
         k.sum = try k.batch.function("fn_sum_slices");
         k.moe_sum = try k.batch.function("fn_moe_sum");
         k.copy_cols = try k.batch.function("fn_copy_cols");
@@ -202,6 +224,11 @@ pub const Kernels = struct {
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
+        k.chain_late = try k.batch.function("fn_gdn_rows_late");
+        k.conv_roll = try k.batch.function("fn_conv_roll");
+        k.front_lanes = try k.batch.function("fn_gdn_front_lanes");
+        k.chain_lanes = try k.batch.function("fn_gdn_rows_late_lanes");
+        k.shift_lanes = try k.batch.function("fn_shift_window_lanes");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
         k.gdn_fused = try k.batch.function("fn_gdn_fused");
@@ -211,6 +238,7 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.expert_tile) |*t| t.unload();
         k.nvfp4.unload();
         k.native_lane.unload();
         k.batch.unload();
@@ -343,6 +371,8 @@ pub const Scratch = struct {
     host: ?cuda.HostBuffer = null,
     /// The uploads from `host` and the event recorded after a pass's last one: the next pass waits before writing it.
     staging: ?Staging(Uploads) = null,
+    /// The shared expert's second stream and its fork and join events, made on first use (cuda_batch_side.zig).
+    side: ?@import("cuda_batch_side.zig").Side = null,
 
     fn add(s: *Scratch, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
         var b = try cuda.DeviceBuffer.alloc(d, @max(len, 256));
@@ -497,6 +527,8 @@ pub const Scratch = struct {
     }
 
     pub fn free(s: *Scratch, gpa: std.mem.Allocator) void {
+        // the stream drains first: its kernels read and write buffers freed below
+        if (s.side) |*sd| sd.deinit();
         if (s.staging) |*g| {
             // no queued upload may still read `host`; a wait that fails has lost the context, and its copies with it
             g.ready() catch {};
@@ -525,6 +557,8 @@ pub const SeqState = struct {
     cap: usize,
     /// Block scores for an attention block's rows [min(rows, att_rows), scoreStride(cap)] fp32 (the engine's).
     scores: u64,
+    /// The format of kc and vc (cuda_kv.zig): bf16 rows, or --kv-cache fp8's codes and scales.
+    kv: @import("cuda_kv.zig").Kv = .bf16,
 };
 
 /// The block scores' row stride for a cache of `cap` tokens: its blocks rounded up to 16 (the captured _scores').
@@ -573,6 +607,18 @@ pub const Gather = struct {
         defer g.ns = std.Io.Clock.awake.now(g.io).toNanoseconds() - t0;
         if (g.lanes.len == 0) {
             g.ngram.rows(g.history, g.ids, g.emb, g.xs) catch |err| {
+                g.failed = err;
+            };
+            return;
+        }
+        if (knobs.gatherEarly() and g.lanes.len <= 64) {
+            var parts: [64]ple.Part = undefined;
+            var at: usize = 0;
+            for (g.lanes, 0..) |l, k| {
+                parts[k] = .{ .history = l.seq.history[0..], .tokens = g.ids[at..][0..l.rows], .out = g.emb[at * dims ..][0 .. l.rows * dims], .xs = g.xs[at * (dims / 32) ..][0 .. l.rows * (dims / 32)] };
+                at += l.rows;
+            }
+            ple.rowsMany(g.ngram, parts[0..g.lanes.len]) catch |err| {
                 g.failed = err;
             };
             return;

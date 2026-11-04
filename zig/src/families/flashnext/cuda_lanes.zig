@@ -8,6 +8,10 @@ const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const mtp_ops = @import("cuda_mtp_ops.zig");
 const lanes_draft = @import("cuda_lanes_draft.zig");
+const ple = @import("cuda_ple.zig");
+const ple_reader = @import("cuda_ple_reader.zig");
+const planStop = @import("cuda_prompt_chunks.zig").planStop;
+const round_costs = @import("cuda_round_costs.zig");
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
 const config = @import("cuda_config.zig");
@@ -53,7 +57,7 @@ pub fn Namespace(comptime Tri: type) type {
             pub const min_prompt: u32 = 512;
         };
 
-        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551 };
+        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, kv8: bool = false };
 
         /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
         pub const slide = slide_mod.Slide(Tri);
@@ -128,6 +132,8 @@ pub fn Namespace(comptime Tri: type) type {
             chain: mtp.Chain = .{},
             /// The prompt's next row while its pass runs a chunk a call; null once the prompt is in.
             filled: ?usize = 0,
+            /// The prompt row up to which the n-gram rows have been asked for ahead (TF_FLASHNEXT_WARM_AHEAD=1).
+            ahead_to: usize = 0,
         };
 
         const Ops = mtp.Ops(Tri);
@@ -141,6 +147,9 @@ pub fn Namespace(comptime Tri: type) type {
             head: ?*mtp.Head = null,
             depth: usize = mtp.default_depth,
             confidence: f64 = mtp.default_confidence,
+            /// With a running-product confidence (< 0): the streams drafting together up to which it applies, the per-draft
+            /// mtp.wide_confidence above (TF_FLASHNEXT_PRODUCT_STREAMS, default 2: the old recipe engine's served hybrid)
+            product_streams: usize = 2,
             /// A captured Triton set (TENSORFOLD_CUDA_KERNELS) for comparison, else null: our own glue.
             set: ?cuda.aot.Set = null,
             glue: Glue,
@@ -216,9 +225,17 @@ pub fn Namespace(comptime Tri: type) type {
                     .hidden_rows = true,
                     .batch_rows = if (drafting) 4 * mtp.max_rows else round_streams,
                     .max_streams = round_streams,
+                    // a shared round's prices when TF_FLASHNEXT_ROUND_MS names them (cuda_round_costs.zig); else unpriced
+                    .shared_costs = round_costs.sharedCosts(),
+                    .draft_row_ms = round_costs.draftRowMs(),
                     // a shared round's greedy streams draft in one head pass a step (lanes_draft.batched)
                     .draft_streams = drafting and lanes_draft.batchHeads(),
                 };
+            }
+
+            /// The stop rule for a step drafting `drafting` streams together (mtp.confidenceFor).
+            pub fn confidenceNow(self: *const Cuda, drafting: usize) f64 {
+                return mtp.confidenceFor(self.confidence, drafting, self.product_streams);
             }
 
             fn take(self: *Cuda, token: u32) u64 {
@@ -273,7 +290,7 @@ pub fn Namespace(comptime Tri: type) type {
                     dropLane(self, l);
                     self.lanes.removeByPtr(gop.key_ptr);
                 }
-                if (drafting) l.draft = try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
+                if (drafting) l.draft = try mtp.Draft.initFor(mtp.headFormat(self.engine.kv, cap, @min(self.context + mtp.max_rows, prompt.max_tokens), self.head.?.ids.len, self.engine.chunk), self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
                 if (s.images.len != 0) {
                     const v = self.vision orelse return error.VisionNotEnabled;
                     l.seq.media = try v.state(ids, s.images);
@@ -298,16 +315,32 @@ pub fn Namespace(comptime Tri: type) type {
                 return l;
             }
 
+            /// The n-gram rows of the chunk after [at, stop) (and of this one, the first time) read in the background while this chunk runs.
+            fn warmNext(self: *Cuda, l: *Lane, ids: []const u32, at: usize, stop: usize) void {
+                const g = &self.engine.ngram;
+                const n1 = g.hash.n - 1;
+                if (g.reader == null or n1 != l.seq.history.len) return;
+                const to = if (stop < ids.len) planStop(self.engine.chunk, ids.len, stop, &.{}, ple_reader.prefillTail()) else stop;
+                const from = @max(l.ahead_to, at);
+                if (from >= to) return;
+                var hist: [ple.max_n]i64 = undefined;
+                if (from == at) {
+                    @memcpy(hist[0..n1], l.seq.history[0..]);
+                } else {
+                    if (from < n1) return;
+                    for (0..n1) |k| hist[k] = ids[from - n1 + k];
+                }
+                g.aheadChunk(hist[0..n1], ids[from..to]);
+                l.ahead_to = to;
+            }
+
             /// One prompt chunk, cut at the next cache mark; true once the last row's scores are in seq.logits.
             fn step(self: *Cuda, s: *lanes.Stream, l: *Lane) !bool {
                 const ids = s.prompt();
                 const at = l.filled orelse return true;
                 if (s.isCancelled()) return error.Cancelled;
-                var stop = @min(ids.len, at + self.engine.chunk);
-                for (s.reuse.marks) |m| if (m > at and m < stop) {
-                    stop = m;
-                    break;
-                };
+                const stop = planStop(self.engine.chunk, ids.len, at, s.reuse.marks, ple_reader.prefillTail());
+                if (ple_reader.warmAhead()) self.warmNext(l, ids, at, stop);
                 const last = stop == ids.len;
                 if (l.draft) |*d| {
                     try self.ops().prefillChunk(&l.seq, d, ids, at, stop);
@@ -480,7 +513,8 @@ pub fn Namespace(comptime Tri: type) type {
             const self = of(ptr);
             if (self.head == null) return error.NoDraftHead;
             defer lanes_draft.depthLog(self, requests);
-            // greedy chains of a shared round: their heads in one pass a step (the drafts each would get alone)
+            // greedy chains of a shared round (sampled ones too with TF_FLASHNEXT_SAMPLED_HEADS=1): their heads in one pass a step
+            // (the drafts each would get alone)
             var batched: [mtp_ops.max_lanes]bool = @splat(false);
             if (lanes_draft.batchHeads() and requests.len > 1 and requests.len <= mtp_ops.max_lanes) try lanes_draft.batched(self, requests, &batched);
             for (requests, 0..) |r, ri| {
@@ -496,13 +530,18 @@ pub fn Namespace(comptime Tri: type) type {
                 // the window's rows past the cache's room cannot run: fewer drafts there
                 const room = l.seq.cap - l.seq.fed - 1;
                 const count = @min(@min(r.depth, self.depth), room);
+                var ahead_buf = ple.Ahead.init(&self.engine.ngram);
+                const ahead: ?*ple.Ahead = if (ahead_buf) |*a| a else null;
+                if (ahead) |a| a.lane(0, l.seq.history[0..]);
                 if (r.rows) |path| {
                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                     if (r.follow.len < path.len) return error.PositionMismatch;
-                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    if (ahead) |a| a.push(0, r.follow[path.len - 1]);
+                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain, ahead);
                 } else {
                     const first = self.value(r.first orelse return error.NoFirstToken);
-                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidence, &l.chain);
+                    if (ahead) |a| a.push(0, first);
+                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain, ahead);
                 }
             }
         }
@@ -541,7 +580,7 @@ pub fn Namespace(comptime Tri: type) type {
             _ = @import("cuda_score.zig").CapabilityCases(Cuda);
         }
 
-        test "a bad TF_FLASHNEXT_CHUNK is refused at load before the loader takes a stream, a module or a buffer" {
+        test "a bad TF_FLASHNEXT_CHUNK or PROMPT_EXPERT_TILE is refused at load before the loader takes anything" {
             const env = @import("sys").env;
             defer _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
             // every driver entry point undefined: the refusal must come before the first call
@@ -551,12 +590,20 @@ pub fn Namespace(comptime Tri: type) type {
                 _ = env.setenv("TF_FLASHNEXT_CHUNK", bad, 1);
                 try std.testing.expectError(error.BadChunk, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
             }
+            _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
+            defer _ = env.unsetenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE");
+            for ([_][*:0]const u8{ "3", "on" }) |bad| {
+                _ = env.setenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE", bad, 1);
+                try std.testing.expectError(error.BadExpertTile, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
+            }
         }
 
         // -- the prompt cache's copies ------------------------------------------------------------------------
 
         fn snapBytes(ptr: *anyopaque, at: u32) u64 {
-            return snap.bytes(at, of(ptr).head != null);
+            const self = of(ptr);
+            // a state is sized by the larger head cache a stream may hold
+            return snap.bytesWith(self.engine.kv, if (self.head != null) .bf16 else null, at);
         }
 
         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).
@@ -569,6 +616,7 @@ pub fn Namespace(comptime Tri: type) type {
                 if (l.draft != null) return error.TensorRankDraftSnapshotUnavailable;
                 return try r.save(&l.seq);
             }
+            if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
             return try snap.save(self.gpa, self.engine.driver, self.stream, &l.seq, if (l.draft) |*d| d else null);
         }
 

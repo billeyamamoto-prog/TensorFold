@@ -28,6 +28,27 @@ extern "C" __global__ void fn_shift_window(__nv_bfloat16* __restrict__ win, cons
     for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
 }
 
+// Every layer's conv window [taps, c] (wins[layer]) past a rollback's first `n` rows in one launch: its saved history (taps rows,
+// hist_stride apart a layer) and its saved projection rows (proj_layer_stride apart, proj_row_stride a row) make the rows
+// [n, n + taps) of [history; projection rows], what fn_shift_window leaves of a window that was just copied from the history.
+extern "C" __global__ void fn_conv_roll(const unsigned long long* __restrict__ wins, const __nv_bfloat16* __restrict__ hist,
+                                        long long hist_stride, const __nv_bfloat16* __restrict__ proj,
+                                        long long proj_layer_stride, long long proj_row_stride, int n, int taps, int c) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    const int layer = blockIdx.y;
+    __nv_bfloat16* win = reinterpret_cast<__nv_bfloat16*>(wins[layer]);
+    const __nv_bfloat16* h = hist + layer * hist_stride;
+    const __nv_bfloat16* rows = proj + layer * proj_layer_stride;
+    __nv_bfloat16 next[16];
+    for (int j = 0; j < taps; ++j) {
+        const int src = j + n;
+        next[j] = src < taps ? h[static_cast<long long>(src) * c + ch]
+                             : rows[static_cast<long long>(src - taps) * proj_row_stride + ch];
+    }
+    for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
+}
+
 // ---- the DeltaNet chain over a chunk: flashnext_gdn.cu's chain cut into front, rows and norm, with its bits ----
 
 namespace fn_gdn {
@@ -61,7 +82,7 @@ static __device__ __forceinline__ float conv_act(const __nv_bfloat16* __restrict
 }  // namespace fn_gdn
 
 // Program (row, unit), 256 threads: key head u's normed q and k (u < NK), else a value head's v, decay g and beta.
-extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
+static __device__ __forceinline__ void gdn_front(
         const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
         const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ qn,
         float* __restrict__ kn, float* __restrict__ v, float* __restrict__ gb) {
@@ -96,6 +117,13 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
             gb[((size_t)r * NV + hv) * 2 + 1] = bf(sigmoidf_(b));
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
+        const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ qn,
+        float* __restrict__ kn, float* __restrict__ v, float* __restrict__ gb) {
+    gdn_front(P, cs, cw, a_log, dt_bias, qn, kn, v, gb);
 }
 
 // The chain through the chunk from state_in to state_out (in place, or apart for a rollback): a warp 4 state rows.
@@ -175,6 +203,160 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_to(
         const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
         const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
     gdn_rows(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+}
+
+// fn_gdn_rows_to's chain after `np` earlier rows whose steps are taken first (TF_FLASHNEXT_KEEP_LATE): a rolled-back window's kept
+// rows wait in the lane's log as their front left them (kn, v, gb rows 0 .. np - 1, no readout), and this window's rows follow them
+// there (rows np ..); qn and ys_out hold the window's own rows from 0. Each step is fn_gdn_rows_to's, so the state it ends on has the
+// bits of the kept rows replayed on their own and the window chained after.
+static __device__ __forceinline__ void gdn_rows_late(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out, int np) {
+    using namespace fn_gdn;
+    const int hv = blockIdx.x, hk = hv / (NV / NK), warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = blockIdx.y * 16 + warp * 4;
+    const size_t sbase = (size_t)hv * DV * DK;
+    float s[4][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
+    for (int p = 0; p < np; ++p) {
+        const float4 k4 = *reinterpret_cast<const float4*>(kn + ((size_t)p * NK + hk) * DK + lane * 4);
+        const float4 v4 = *reinterpret_cast<const float4*>(v + (size_t)p * NV * DV + hv * DV + row0);
+        const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
+        const float vv[4] = {v4.x, v4.y, v4.z, v4.w};
+        const float g = gb[((size_t)p * NV + hv) * 2];
+        const float beta = gb[((size_t)p * NV + hv) * 2 + 1];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float kv = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[j][i] = s[j][i] * g;
+                kv = kv + s[j][i] * kk[i];
+            }
+            kv = warp_sum(kv);
+            const float delta = (vv[j] - kv) * beta;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s[j][i] = s[j][i] + kk[i] * delta;
+        }
+    }
+    for (int r = 0; r < rows; ++r) {
+        const size_t rk = (size_t)np + r;
+        const float4 k4 = *reinterpret_cast<const float4*>(kn + (rk * NK + hk) * DK + lane * 4);
+        const float4 q4 = *reinterpret_cast<const float4*>(qn + ((size_t)r * NK + hk) * DK + lane * 4);
+        const float4 v4 = *reinterpret_cast<const float4*>(v + rk * NV * DV + hv * DV + row0);
+        const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
+        const float qq[4] = {q4.x, q4.y, q4.z, q4.w};
+        const float vv[4] = {v4.x, v4.y, v4.z, v4.w};
+        const float g = gb[(rk * NV + hv) * 2];
+        const float beta = gb[(rk * NV + hv) * 2 + 1];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float kv = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[j][i] = s[j][i] * g;
+                kv = kv + s[j][i] * kk[i];
+            }
+            kv = warp_sum(kv);
+            const float delta = (vv[j] - kv) * beta;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s[j][i] = s[j][i] + kk[i] * delta;
+        }
+        float o4[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float o = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
+            o4[j] = bf(warp_sum(o));
+        }
+        if (lane == 0) *reinterpret_cast<float4*>(ys_out + ((size_t)r * NV + hv) * DV + row0) = make_float4(o4[0], o4[1], o4[2], o4[3]);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
+}
+
+// rows 0: only the `np` waiting rows are taken (state_in == state_out settles a lane's log on its sequence).
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out, int np) {
+    gdn_rows_late(qn, kn, v, gb, state_in, state_out, rows, ys_out, np);
+}
+
+// ---- the lanes of a shared round in one launch a step (TF_FLASHNEXT_GDN_LANES) ----------------------------------------------
+// One layer of a shared verify round with every lane's rows logged (TF_FLASHNEXT_KEEP_LATE): what the per-lane loop launches as
+// copy proj, copy history, fn_gdn_front, fn_gdn_rows_late and fn_shift_window a lane, as three launches for all lanes. Each lane's
+// program is the per-lane kernel's on that lane's pointers, so every output byte is the same; the lanes touch disjoint memory.
+constexpr int FN_LANES_MAX = 8;
+struct FnGdnLane {
+    const __nv_bfloat16* proj;   // the lane's projection rows [rows, PW]
+    __nv_bfloat16* conv;         // the lane's conv window [TAPS - 1, C], shifted past the rows at the end
+    __nv_bfloat16* proj_save;    // copy of proj (rows x PW), or null
+    __nv_bfloat16* hist_save;    // copy of the window before the shift ([TAPS - 1, C]), or null
+    float* qn;                   // this window's q rows [rows, NK, DK]
+    float* log_k;                // the lane's log of k, v, decay and beta rows (the first np rows wait there)
+    float* log_v;
+    float* log_gb;
+    const float* state_in;
+    float* state_out;
+    float* ys;                   // readouts [rows, NV, DV]
+    int rows;
+    int np;
+};
+struct FnGdnLanes {
+    FnGdnLane lane[FN_LANES_MAX];
+    int count;
+    int max_rows;
+};
+
+// Program (lane, row, unit), 256 threads: the lane's fn_gdn_front of row r (k, v and gates to the log after its np waiting rows),
+// and, on the side, a slice of the copy of the lane's projection rows.
+extern "C" __global__ void __launch_bounds__(256) fn_gdn_front_lanes(
+        const __grid_constant__ FnGdnLanes L, const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log,
+        const float* __restrict__ dt_bias) {
+    using namespace fn_gdn;
+    const FnGdnLane& l = L.lane[blockIdx.z];
+    if (blockIdx.x >= l.rows) return;
+    if (l.proj_save != nullptr) {
+        const unsigned total = (unsigned)l.rows * (PW / 2);
+        const unsigned per = (total + (unsigned)l.rows * gridDim.y - 1) / ((unsigned)l.rows * gridDim.y);   // the lane's blocks: rows x units
+        const unsigned b = blockIdx.x * gridDim.y + blockIdx.y;
+        const unsigned lo = b * per;
+        const unsigned hi = lo + per < total ? lo + per : total;
+        const unsigned* src = reinterpret_cast<const unsigned*>(l.proj);
+        unsigned* dst = reinterpret_cast<unsigned*>(l.proj_save);
+        for (unsigned i = lo + threadIdx.x; i < hi; i += blockDim.x) dst[i] = src[i];
+    }
+    gdn_front(l.proj, l.conv, cw, a_log, dt_bias, l.qn, l.log_k + (size_t)l.np * NK * DK, l.log_v + (size_t)l.np * NV * DV,
+              l.log_gb + (size_t)l.np * NV * 2);
+}
+
+// Program (lane, block of 128 threads): fn_gdn_rows_late on the lane's pointers.
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late_lanes(const __grid_constant__ FnGdnLanes L) {
+    const FnGdnLane& l = L.lane[blockIdx.z];
+    gdn_rows_late(l.qn, l.log_k, l.log_v, l.log_gb, l.state_in, l.state_out, l.rows, l.ys, l.np);
+}
+
+// Program (lane, 256 channels): the lane's history copy and fn_shift_window (taps rows, c channels, the lane's rows PW apart).
+extern "C" __global__ void __launch_bounds__(256) fn_shift_window_lanes(const __grid_constant__ FnGdnLanes L, int taps, int c) {
+    using namespace fn_gdn;
+    const FnGdnLane& l = L.lane[blockIdx.y];
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= c) return;
+    __nv_bfloat16* win = l.conv;
+    __nv_bfloat16 next[16];
+    for (int j = 0; j < taps; ++j) {
+        const int src = j + l.rows;
+        next[j] = src < taps ? win[(long long)src * c + ch] : l.proj[(long long)(src - taps) * PW + ch];
+    }
+    if (l.hist_save != nullptr)
+        for (int j = 0; j < taps; ++j) l.hist_save[(long long)j * c + ch] = win[(long long)j * c + ch];
+    for (int j = 0; j < taps; ++j) win[(long long)j * c + ch] = next[j];
 }
 
 extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm(

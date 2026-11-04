@@ -239,7 +239,13 @@ pub fn read(a: std.mem.Allocator, bytes: []const u8, why: *Why) Error!Vector {
 
 /// Check the vector against the model it would steer: its width and the checkpoint it came from.
 pub fn checkModel(v: Vector, hidden: usize, base_model: []const u8, why: *Why) Error!void {
-    if (v.width != hidden) return refuse(why, "the vector's directions are {d} wide; the model is {d}", .{ v.width, hidden });
+    return checkWidth(v, hidden, base_model, why);
+}
+
+/// The same check for a model whose steerable surface is wider than one hidden row: a
+/// multi-stream vector spans the materialized stream (hidden x streams), not one stream.
+pub fn checkWidth(v: Vector, width: usize, base_model: []const u8, why: *Why) Error!void {
+    if (v.width != width) return refuse(why, "the vector's directions are {d} wide; this model steers a {d}-wide stream", .{ v.width, width });
     if (base_model.len > 0 and v.base_model.len > 0 and !sameModel(v.base_model, base_model)) {
         return refuse(why, "the vector is for {s}; the model is {s}", .{ v.base_model, base_model });
     }

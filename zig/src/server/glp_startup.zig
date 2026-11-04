@@ -20,6 +20,13 @@ const steer_types = [_][]const u8{ "qwen3_5", "qwen4_exp" };
 /// The hidden sizes those families are wide: 5120 and 2560.
 const steer_hiddens = [_]usize{ 5120, 2560 };
 
+/// The width a control vector must have for a checkpoint: Qwen3.8-27B steers one hidden row;
+/// Flash Next's 2560-wide checkpoint steers the materialized 4-stream hyper-connection state,
+/// which is what the shipped GLP vectors are fit at (4 x 2560 = 10240).
+fn steerWidth(hidden: usize) usize {
+    return if (hidden == 2560) hidden * 4 else hidden;
+}
+
 /// Whether this model type is steered on this backend: 27B on Metal, Flash Next on CUDA.
 fn steerable(model_type: []const u8, backend: []const u8) bool {
     if (std.mem.eql(u8, model_type, "qwen3_5")) return metal(backend);
@@ -131,7 +138,7 @@ pub fn refusal(a: std.mem.Allocator, dir: []const u8, model_type: []const u8, ba
     const vector = v.vector orelse return null;
     const model = modelOf(a, dir);
     var why: glp.Why = .{};
-    if (model.hidden) |hidden| glp.checkModel(vector, hidden, model.repo, &why) catch {
+    if (model.hidden) |hidden| glp.checkWidth(vector, steerWidth(hidden), model.repo, &why) catch {
         return try std.fmt.allocPrint(a, "--glp: {s}", .{why.text()});
     };
     if (model.layers) |layers| {

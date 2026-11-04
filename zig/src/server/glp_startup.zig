@@ -14,11 +14,18 @@ pub const flags = [_]cli_flag.Flag{
     .{ .name = "--glp-alpha", .native = true },
 };
 
-/// The model type of the family that takes a control vector: Qwen3.8-27B.
-const steer_type = "qwen3_5";
+/// The model types of the families that take a control vector: Qwen3.8-27B (Metal) and Flash Next (CUDA).
+const steer_types = [_][]const u8{ "qwen3_5", "qwen4_exp" };
 
-/// The hidden size of that family: Qwen3.8-27B is 5120 wide.
-const steer_hidden: usize = 5120;
+/// The hidden sizes those families are wide: 5120 and 2560.
+const steer_hiddens = [_]usize{ 5120, 2560 };
+
+/// Whether this model type is steered on this backend: 27B on Metal, Flash Next on CUDA.
+fn steerable(model_type: []const u8, backend: []const u8) bool {
+    if (std.mem.eql(u8, model_type, "qwen3_5")) return metal(backend);
+    if (std.mem.eql(u8, model_type, "qwen4_exp")) return cuda(backend);
+    return false;
+}
 
 /// The bytes a control vector file may hold; a 64-layer 5120-wide vector is about 1.3 MiB.
 const file_limit: usize = 64 << 20;
@@ -133,9 +140,14 @@ pub fn refusal(a: std.mem.Allocator, dir: []const u8, model_type: []const u8, ba
         }
     }
     if (isGemma(model_type)) return "--glp: Gemma's terms of use forbid circumventing its safety filters, so a Gemma checkpoint is never steered: serve it without --glp";
-    if (!std.mem.eql(u8, model_type, steer_type)) return try std.fmt.allocPrint(a, "--glp: {s} checkpoints are not steered: only Qwen3.8-27B takes a control vector", .{model_type});
-    if (model.hidden) |hidden| if (hidden != steer_hidden) return "--glp: this checkpoint is not Qwen3.8-27B: only the 5120-wide one takes a control vector";
-    if (!metal(backend)) return try std.fmt.allocPrint(a, "--glp: only the Metal engine steers: this server runs the {s} engine", .{backendName(backend)});
+    if (!steerable(model_type, backend)) return try std.fmt.allocPrint(a, "--glp: {s} checkpoints are not steered on the {s} engine: only Qwen3.8-27B (Metal) and Flash Next (CUDA) take a control vector", .{ model_type, backendName(backend) });
+    if (model.hidden) |hidden| {
+        var wide = false;
+        for (steer_hiddens) |w| {
+            if (hidden == w) wide = true;
+        }
+        if (!wide) return try std.fmt.allocPrint(a, "--glp: this checkpoint is {d} wide: control vectors fit the 5120-wide Qwen3.8-27B and the 2560-wide Flash Next only", .{hidden});
+    }
     return null;
 }
 
@@ -184,6 +196,12 @@ fn isGemma(model_type: []const u8) bool {
 fn metal(backend: []const u8) bool {
     if (builtin.os.tag != .macos) return false;
     return std.mem.eql(u8, backend, "auto") or std.mem.eql(u8, backend, "mlx");
+}
+
+/// The backend Flash Next steers on: the CUDA engine (this fork's lane).
+fn cuda(backend: []const u8) bool {
+    if (builtin.os.tag == .macos) return false;
+    return std.mem.eql(u8, backend, "auto") or std.mem.eql(u8, backend, "cuda");
 }
 
 /// The engine a backend names, as the operator reads it.

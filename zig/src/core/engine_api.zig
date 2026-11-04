@@ -25,6 +25,10 @@ pub const seedFor = lanes.sampling.seedFor;
 
 /// A committed token's log probability under the target's raw distribution, with the best tokens at its position.
 pub const LogprobRow = lanes.LogprobRow;
+/// GLP control vectors: the file format, the checks and the strength (weightless, in-model steering).
+pub const glp = @import("glp.zig");
+/// The control vector a serve applies to the residual stream (--glp).
+pub const Glp = glp.Glp;
 
 /// The request's stop strings, checked on the engine's thread after each committed token (the server decodes the tail).
 pub const Stop = struct { ctx: *anyopaque, check: *const fn (ctx: *anyopaque, emitted: []const u32) bool };
@@ -303,6 +307,8 @@ pub const Open = struct {
     drafter_name: ?[]const u8 = null, // the supplied --drafter name, before resolving its directory
     drafter_bits: u8 = 4,
     rope_yarn: ?f64 = null, // --rope-yarn: YaRN over the checkpoint's trained window; families without it refuse
+    /// --glp: the control vector the engine applies to the residual stream (null: none).
+    glp: ?Glp = null,
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,

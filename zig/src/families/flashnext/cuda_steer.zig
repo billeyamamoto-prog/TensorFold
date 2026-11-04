@@ -4,13 +4,14 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+const steer_source = @import("steer_source.zig");
 const Allocator = std.mem.Allocator;
 
 /// How the vector acts: subtract the component along the direction (the CUDA lane's only mode).
 pub const Mode = enum(u8) { project, add };
 
-/// One layer's direction: the checkpoint's layer id and its unit vector, hidden floats wide.
-pub const Layer = struct { id: u32, dir: []const f32 };
+/// One layer's direction: the checkpoint's layer id and its f32 row over the materialized stream.
+pub const Layer = steer_source.Layer;
 
 /// What the plan is built from: the vector's directions, the width and the stream count they fit.
 pub const Source = struct {
@@ -58,10 +59,18 @@ pub const Plan = struct {
             a.free(plan.dirs);
         }
         for (src.layers) |l| {
-            if (l.id >= src.layers_total or l.dir.len != src.hidden) return error.BadSource;
-            if (plan.dirs[l.id] != null) return error.BadSource; // a layer steers once
-            const bytes = std.mem.sliceAsBytes(l.dir);
-            plan.dirs[l.id] = cuda.DeviceBuffer.fromHost(d, bytes) catch |e| switch (e) {
+            if (l.id >= src.layers_total) return error.BadSource;
+        }
+        // The shape rules and unit normalization live in the device-free steer_source, so they are tested.
+        const dirs = steer_source.prepared(a, src.hidden, src.streams, src.layers_total, src.layers) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadSource => return error.BadSource,
+        };
+        defer for (dirs) |dd| if (dd) |v| a.free(v);
+        defer a.free(dirs);
+        for (dirs, 0..) |dd, i| {
+            const dir = dd orelse continue;
+            plan.dirs[i] = cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(dir)) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.Cuda,
             };

@@ -32,10 +32,15 @@ fn sweepOf(m: usize, bm: usize, k: usize) usize {
 }
 
 /// x [m, k] times w: the native lane, the 16-row lane tile, or from 64 rows the prompt tile (folded with K slices).
-pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize) !usize {
+pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize, prompt: bool) !usize {
     if (w.native) |native| {
         if (sk == 1) {
-            try k.nativeMatmul(stream, x, w.k, m, native, out, native_part, .bf16);
+            if (prompt) try k.nativeMatmulPrompt(stream, x, w.k, m, native, out, .bf16, native_part) else try k.nativeMatmul(stream, x, w.k, m, native, out, native_part, .bf16);
+            return 1;
+        }
+        if (prompt) {
+            // slice 0 holds the whole sum (the native lane reduces its own slices): callers sum one slice, no zero fill
+            try k.nativeMatmulPrompt(stream, x, w.k, m, native, part, .f32, native_part);
             return 1;
         }
         // the native lane has reduced its own slices: that slice and one zero slice give the old sums' bits (-0 to +0)

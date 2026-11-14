@@ -8,6 +8,7 @@ const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
+const knobs = @import("cuda_knobs.zig");
 const chunks = @import("cuda_chunk.zig");
 pub const kv_format = @import("cuda_kv.zig");
 const layers_n = weights.layers_n;
@@ -150,6 +151,7 @@ pub const Engine = struct {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK or TF_FLASHNEXT_PROMPT_EXPERT_TILE leaves no module or buffer behind
+        cuda.qmmf.prompt_mx_min_n = knobs.mx128MinN();
         const busy = try chunkRows();
         const chunk = try chunks.soloRows(busy, false);
         _ = try cuda.nvfp4_tile.Config.fromEnv();
@@ -412,6 +414,7 @@ pub const Engine = struct {
             .m = if (seq.untaught) e.shipped() else e.model(),
             .seq = seq.view(scores),
             .hooks = hooks,
+            .prompt = hooks.logits != .all and hooks.keep == null and hooks.moe_add == null,
         };
         if (try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, seq, ids, hooks)) return;
         var at: usize = 0;
@@ -424,7 +427,8 @@ pub const Engine = struct {
             try p.chunk(ids[at..][0..n], seq.fed + at, if (last and hooks.logits != .none and hooks.host_logits) seq.logits else null);
             at += n;
         }
-        if (hooks.logits == .none) try e.complete();
+        // a drain after every non-final chunk starves the GPU while the host rebuilds the next one's launches (and its n-gram gather)
+        if (hooks.logits == .none and (e.collective != null or knobs.chunkSync())) try e.complete();
         seq.fed += ids.len;
     }
     /// A stream's window in a shared pass and the pass over several (cuda_prompt_windows.zig).

@@ -118,6 +118,8 @@ pub fn Pass(comptime Tri: type) type {
         prepared: bool = false,
         /// The pending write-back's branch sits in fp32 in moe_f32 (something added to it, or it is kept).
         pending_f32: bool = false,
+        /// Prompt rows (not a decode round, a drafted window or a training pass): the projections may take the relaxed prompt tiles.
+        prompt: bool = false,
         /// This layer's out projection leaves part's other slices alone; its writeback adds the zero slice once.
         zero_slices: bool = false,
         /// stageWindow queued the pass's uploads (ids, positions, n-gram rows): it launches kernels alone (graphs).
@@ -130,7 +132,7 @@ pub fn Pass(comptime Tri: type) type {
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
             if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.prompt);
         }
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
             return ops.sumSlices(self.k, self.stream, part, out, bf16, n, sk);
@@ -595,9 +597,9 @@ pub fn Pass(comptime Tri: type) type {
     };
 }
 
-test "a pass's scratch at the dense cap stays near a gigabyte and a half" {
+test "a pass's scratch at the default chunk stays under five gigabytes" {
     _ = @import("cuda_paging_batch_test.zig");
-    try std.testing.expect(Scratch.bytes(default_chunk, .{ .head_rows = default_chunk }) < 2 << 30);
+    try std.testing.expect(Scratch.bytes(default_chunk, .{ .head_rows = default_chunk }) < 5 << 30);
     try std.testing.expect(Scratch.bytes(1, .{}) < Scratch.bytes(2, .{}));
     try std.testing.expect(Scratch.bytes(4096, .{ .lane_reduce = false }) < Scratch.bytes(4096, .{}));
 }

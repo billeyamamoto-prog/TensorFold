@@ -157,6 +157,11 @@ pub const Kernels = struct {
         return k.native_lane.matmulOut(s, x, ldx, m, w, y, out, part);
     }
 
+    /// nativeMatmul for rows of a prompt pass: MXFP8 weights wide enough take the relaxed 128 x 128 prompt tile (qmmf.Lane.matmulPrompt).
+    pub fn nativeMatmulPrompt(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, m: usize, w: cuda.qmmf.Weight, y: u64, out: cuda.qmmf.Out, part: u64) !void {
+        return k.native_lane.matmulPrompt(s, x, ldx, m, w, y, out, part);
+    }
+
     /// TF_FLASHNEXT_PROFILE=1: each chunk's wall time (synchronized) and its host n-gram gather on stderr.
     pub fn profile() bool {
         // the startup check refused every malformed value already, so a plain default stands here

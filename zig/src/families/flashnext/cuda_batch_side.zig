@@ -52,7 +52,11 @@ pub fn down(pass: anytype, st: cuda.Stream, input: u64, native: anytype, n: usiz
         return pass.k.native_lane.matmulF32Strided(st, input, moe_w, n, w, s.y + (slots - 1) * dims * 4, slots * dims);
     const glue = pass.tri.own orelse return error.NativeGlueRequired;
     try pass.k.nativeMatmul(st, input, moe_w, n, w, s.shared_out, s.native_part, .f32);
-    try glue.sharedScatter(st, s.shared_out, s.y, n, dims, slots);
+    // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
+    // (the patch's keep.moe_branch guard is dropped: this tree captures routed sums out of s.moe_f32, not y's slot)
+    if (pass.prompt and @import("cuda_knobs.zig").sharedDirect() and (pass.hooks.logits == .none or pass.hooks.streams != 0) and
+        pass.hooks.moe_add == null and pass.m.pocket == null and native.world == 1) pass.shared_direct = true
+    else try glue.sharedScatter(st, s.shared_out, s.y, n, dims, slots);
 }
 
 /// After y is cleared: the shared expert forked onto the side stream (one GPU, not a prompt fill), or null.

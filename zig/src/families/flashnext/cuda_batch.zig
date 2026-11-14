@@ -130,6 +130,8 @@ pub fn Pass(comptime Tri: type) type {
         pending_f32: bool = false,
         /// Prompt rows (not a decode round, a drafted window or a training pass): the projections may take the relaxed prompt tiles.
         prompt: bool = false,
+        /// The pending MoE write-back reads the shared expert's output from s.shared_out (never scattered into y's last slot).
+        shared_direct: bool = false,
         /// This layer's out projection leaves part's other slices alone; its writeback adds the zero slice once.
         zero_slices: bool = false,
         /// stageWindow queued the pass's uploads (ids, positions, n-gram rows): it launches kernels alone (graphs).
@@ -194,6 +196,11 @@ pub fn Pass(comptime Tri: type) type {
             }
             const y = s.y + r0 * slots * dims * 4;
             const wts = s.wts + r0 * slots * 4;
+            if (self.shared_direct) {
+                self.shared_direct = false;
+                try self.tri.hcWriteback(h, h, pss, s.shared_out + r0 * dims * 4, "*fp32", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 3, 10, 11, 1);
+                return;
+            }
             try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
         }
 
@@ -212,6 +219,7 @@ pub fn Pass(comptime Tri: type) type {
             const act = s.act + r0 * low * 2;
             const xs_act = s.xs_act + r0 * (low / 32) * 4;
             if (hc_w.down.native != null) {
+                if (self.prompt and n >= knobs.hc2MinRows() and knobs.promptHc2() and tiles.nativeFused(hc_w) and std.meta.eql(keep, HcKeep{})) return tiles.readoutNative(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
                 return hc.readoutNative(self, hc_w, r0, n);
             }
@@ -527,6 +535,7 @@ pub fn Pass(comptime Tri: type) type {
             self.pos0 = pos0;
             self.pending = null;
             self.pending_f32 = false;
+            self.shared_direct = false;
             // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
             if (!self.prepared and !self.staged) try s.ready();
             const emb = s.hostEmb(n);

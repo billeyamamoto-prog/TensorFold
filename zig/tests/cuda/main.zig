@@ -107,6 +107,7 @@ const nvfp4_b32_tests = @import("nvfp4_b32_tests.zig");
 const lane_half_tests = @import("lane_half_tests.zig");
 const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
+const flashnext_hc_fuse_tests = @import("flashnext_hc_fuse_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
 const flashnext_kv8_tests = @import("flashnext_kv8_tests.zig");
 const ggml_tests = @import("ggml_tests.zig");
@@ -220,6 +221,7 @@ const usage =
     \\  nvfp4-experts <dir>       grouped NVFP4 experts against recorded fixture bytes
     \\  bf16-experts [contract]   grouped bf16 experts against float64 (repack, up, downs, rows, forms); contract: gates 1-4, controls red
     \\  nvfp4-experts-tile [ROWS[,ROWS] [EXPERTS [time]]]  the prompt expert tile against the decode kernel, byte for byte, and its time (synthetic)
+    \\  hc-fuse                   the fused native hyper-connection read-out against the five-launch chain: bytes, then times
     \\  projection-f32            FP32 projection outputs against FP64, rounding and row/reduction invariance
     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
@@ -396,6 +398,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "hc-fuse")) return flashnext_hc_fuse_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-gdn-heads")) {
         if (rest.len > 1) return error.GdnHeadsArguments;

@@ -65,7 +65,7 @@ const Fake = struct {
         try std.testing.expectEqual(C.expected_pg, pg);
         C.chunks += 1;
     }
-    pub fn attnFusedKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, pg: flash.Pg) !void {
+    pub fn attnFusedKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, pg: flash.Pg) !void {
         try std.testing.expectEqual(C.expected_pg, pg);
     }
     pub fn attnMerge(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {

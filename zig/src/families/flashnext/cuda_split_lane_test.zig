@@ -268,6 +268,7 @@ test "shared expert composition keeps whole direct slots and split full-K output
         m: parts.Model,
         stream: cuda.Stream,
         prompt: bool = false,
+        shared_direct: bool = false,
         hooks: batch.Hooks = .{},
         tri: struct { own: ?*SharedGlue },
     };

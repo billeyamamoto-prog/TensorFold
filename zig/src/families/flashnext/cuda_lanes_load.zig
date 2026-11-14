@@ -96,6 +96,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         const greedy = try @import("sys").environment.read(usize, "TF_FLASHNEXT_DRAFTS_GREEDY", mtp.default_depth_greedy);
         own.depth_greedy = @max(1, @min(mtp.max_chain, greedy));
         own.confidence = try @import("sys").environment.read(f64, "TF_FLASHNEXT_CONFIDENCE", mtp.default_confidence);
+        own.product_streams = @import("sys").environment.read(usize, "TF_FLASHNEXT_PRODUCT_STREAMS", 2) catch 2;
     }
     errdefer if (own.head) |h| h.deinit();
     @import("cuda_prompt_wt.zig").dropPageCache(io, dir, e.ngram.files.items);

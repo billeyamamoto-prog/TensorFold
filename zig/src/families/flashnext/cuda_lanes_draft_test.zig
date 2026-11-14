@@ -10,6 +10,7 @@ const Fake = struct {
     lanes: std.AutoHashMapUnmanaged(*lanes.Stream, void) = .empty,
     depth_greedy: usize = mtp.default_depth_greedy,
     confidence: f64 = mtp.default_confidence,
+    product_streams: usize = 2,
 };
 
 fn stream(finished: bool, paused: bool) lanes.Stream {
@@ -45,7 +46,10 @@ test "draft rule: alone the engine's; beside an open stream greedy stops at 0.6;
 test "draft rule: a sampled stream keeps the engine's stop rule, a greedy one takes the round's" {
     const f: Fake = .{};
     const r: draft.Rule = .{ .greedy = 8, .greedy_stop = 0.6 };
-    try t.expectEqual(@as(f64, 0.6), draft.stopFor(&f, r, null));
-    try t.expectEqual(@as(f64, 0.6), draft.stopFor(&f, r, .{ .seed = 1, .temperature = 0 }));
-    try t.expectEqual(@as(f64, -0.4), draft.stopFor(&f, r, .{ .seed = 1, .temperature = 1 }));
+    try t.expectEqual(@as(f64, 0.6), draft.stopFor(&f, r, null, 1));
+    try t.expectEqual(@as(f64, 0.6), draft.stopFor(&f, r, .{ .seed = 1, .temperature = 0 }, 1));
+    try t.expectEqual(@as(f64, -0.4), draft.stopFor(&f, r, .{ .seed = 1, .temperature = 1 }, 1));
+    // a running product applies only up to product_streams streams drafting together (0017's served hybrid)
+    try t.expectEqual(@as(f64, -0.4), draft.stopFor(&f, r, .{ .seed = 1, .temperature = 1 }, 2));
+    try t.expectEqual(mtp.wide_confidence, draft.stopFor(&f, r, .{ .seed = 1, .temperature = 1 }, 3));
 }

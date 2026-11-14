@@ -32,9 +32,10 @@ pub fn rule(self: anytype, width: usize) Rule {
     return .{ .greedy = greedy, .greedy_stop = stop };
 }
 
-/// A chain's stop rule: a greedy stream's from the round, a sampled stream's always the engine's.
-pub fn stopFor(self: anytype, r: Rule, sm: ?mtp.Sampling) f64 {
-    return if (mtp.isSampled(sm)) self.confidence else r.greedy_stop;
+/// A chain's stop rule: a greedy stream's from the round, a sampled stream's always the engine's
+/// (a running product applies only up to `product_streams` streams drafting together, mtp.confidenceFor).
+pub fn stopFor(self: anytype, r: Rule, sm: ?mtp.Sampling, drafting: usize) f64 {
+    return if (mtp.isSampled(sm)) mtp.confidenceFor(self.confidence, drafting, self.product_streams) else r.greedy_stop;
 }
 
 /// TF_FLASHNEXT_GREEDY_WIDE: the round width (streams drafting together) up to which greedy chains keep their depth.
@@ -108,7 +109,7 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
         ds[n] = d;
         positions[n] = r.position;
         sms[n] = r.stream.sampling;
-        stops[n] = stopFor(self, rl, r.stream.sampling);
+        stops[n] = stopFor(self, rl, r.stream.sampling, requests.len);
         outs[n] = &l.chain;
         which[n] = ri;
         n += 1;

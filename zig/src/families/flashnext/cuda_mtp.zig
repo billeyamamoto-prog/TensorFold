@@ -46,6 +46,8 @@ pub fn depthFor(sm: ?Sampling, depth: usize, greedy: usize) usize {
 }
 /// The chain's stop rule (Stop): the running product of the drafts' probabilities at 0.4; 0.6 per draft before it.
 pub const default_confidence: f64 = -0.4;
+/// The served hybrid's per-draft floor above `product_streams` live streams (the old recipe engine's wide_confidence).
+pub const wide_confidence: f64 = 0.5;
 
 /// TF_FLASHNEXT_CONFIDENCE c > 0: a later draft only at or above c; c < 0: while p1 * ... * pj >= -c; 0: every draft.
 pub const Stop = struct {
@@ -80,6 +82,23 @@ test "the stop rule: per draft above zero, the running product below it, every d
     var all: Stop = .{ .c = 0 };
     try std.testing.expect(all.take(5, 0.01).propose and all.take(6, 0.01).more);
 }
+
+/// The stop rule for a step drafting `drafting` streams together: a running product (c < 0) only up to `product_streams` of them,
+/// the per-draft `wide_confidence` above.
+pub fn confidenceFor(c: f64, drafting: usize, product_streams: usize) f64 {
+    if (c >= 0) return c;
+    return if (drafting <= product_streams) c else wide_confidence;
+}
+
+test "the product rule serves up to product_streams streams, the per-draft floor above" {
+    try std.testing.expectEqual(@as(f64, 0.6), confidenceFor(0.6, 9, 5));
+    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 1, 5));
+    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 5, 5));
+    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 6, 5));
+    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 3, 2));
+    try std.testing.expectEqual(@as(f64, 0), confidenceFor(0, 9, 1));
+}
+
 /// A verify window's rows at most: the pending token and a chain, or a copied continuation.
 pub const max_rows: usize = 32;
 /// A drafting round's rows at most: a shared verify's (TF_FLASHNEXT_WINDOW_ROWS lowers it; 0: each alone).

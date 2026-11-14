@@ -71,6 +71,8 @@ pub const Kernels = struct {
     /// Block-FP8 routed experts (the MTP head of NVIDIA's NVFP4 checkpoint; cuda_moe_native.zig).
     fp8: cuda.experts.Fp8Experts,
     expert_tile: ?cuda.experts_tile.Tile = null,
+    /// The patch's tuned launcher for prompt chunks' NVFP4 experts (nvfp4_tile.zig, TF_FLASHNEXT_PROMPT_EXPERT_TILE*): same bits, owns the pass when set.
+    patched_tile: ?cuda.nvfp4_tile.Tile = null,
     /// The DeltaNet kernels for the whole layer's heads and for a rank's half under the head split (gdnSet).
     gdn: Gdn,
     gdn_h8: Gdn,
@@ -127,6 +129,10 @@ pub const Kernels = struct {
         errdefer k.fp8.unload();
         if (tile_mode != .off) k.expert_tile = try cuda.experts_tile.Tile.load(d, @intCast(sms), tile_mode);
         errdefer if (k.expert_tile) |*tile| tile.unload();
+        const patch_cfg = try cuda.nvfp4_tile.Config.fromEnv(); // strict: a malformed setting is refused at startup
+        k.patched_tile = if (patch_cfg.mode == .off) null else try cuda.nvfp4_tile.Tile.load(d, @intCast(sms), patch_cfg);
+        errdefer if (k.patched_tile) |*tile| tile.unload();
+        if (k.patched_tile) |_| std.log.info("flashnext: prompt experts on the patched row tiles: {s}, {d} pairs an item, from {d} rows", .{ @tagName(patch_cfg.mode), patch_cfg.pairs, patch_cfg.min_rows });
         k.sum = try k.batch.function("fn_sum_slices");
         k.moe_sum = try k.batch.function("fn_moe_sum");
         k.copy_cols = try k.batch.function("fn_copy_cols");
@@ -165,6 +171,7 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.patched_tile) |*tile| tile.unload();
         if (k.expert_tile) |*tile| tile.unload();
         k.fp8.unload();
         k.nvfp4.unload();

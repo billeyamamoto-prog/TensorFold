@@ -25,11 +25,27 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
     const side = try shared.fork(self, native, n);
     switch (owned.format) {
         .nvfp4 => {
-            const pt = nvfp4_tile.size(self.k, n);
-            try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
-            const items = cuda.grouped.maxItems(pairs, e, pt);
-            try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
-            try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+            const gu = nvfp4_tile.patchedGu(self.k, n, native.world);
+            if (gu) |t| {
+                // the patch's launcher owns the pass: its pairs where it takes a leg, the decode kernel's 16 elsewhere
+                const layer = owned.view();
+                const up_in: cuda.experts.Rows = .{ .x = s.mixed, .stride = dims, .slots = slots };
+                const down_in: cuda.experts.Rows = .{ .x = s.moe_act, .stride = owned.width };
+                const gu_pairs = t.cfg.pairs;
+                try self.k.router.route(self.stream, picks, pairs, e, gu_pairs, plan);
+                try t.run(self.stream, .up, up_in, layer, plan, s.moe_act, cuda.grouped.maxItems(pairs, e, gu_pairs), skip);
+                const dn = nvfp4_tile.patchedDn(self.k, n, native.world);
+                const dn_pairs: usize = if (dn) |d| d.cfg.pairs else 16;
+                if (dn_pairs != gu_pairs) try self.k.router.route(self.stream, picks, pairs, e, dn_pairs, plan);
+                if (dn) |d| try d.run(self.stream, .down_f32, down_in, layer, plan, s.y, cuda.grouped.maxItems(pairs, e, dn_pairs), skip)
+                else try nvfp4_tile.run(self.k, 16, self.stream, .down_f32, down_in, layer, plan, s.y, cuda.grouped.maxItems(pairs, e, 16), skip);
+            } else {
+                const pt = nvfp4_tile.size(self.k, n);
+                try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
+                const items = cuda.grouped.maxItems(pairs, e, pt);
+                try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
+                try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+            }
         },
         .fp8g => try fp8(self.k, self.stream, s.picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
         else => return error.UnsupportedQuantization,

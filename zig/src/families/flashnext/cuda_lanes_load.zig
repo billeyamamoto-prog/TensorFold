@@ -20,9 +20,11 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     if (o.segments != 1) return error.UnsupportedOption;
     if (o.tp != 1 and o.tp != 2) return error.FlashNextRanksOverTwo;
     if (o.rank >= o.tp) return error.BadRank;
-    // refused before the stream, the glue or a captured set loads: the largest pass, wider at --parallel 1 on one rank
+    // refused before the stream, the glue or a captured set loads: the largest pass, wider at --parallel 1 on one rank,
+    // the load threads, and the prompt expert tile's settings (mode, pairs, rows)
     const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows(), o.one_stream and o.tp == 1);
     _ = try @import("cuda_modelopt_threads.zig").configured(); // TF_FLASHNEXT_LOAD_THREADS, refused before any load
+    _ = try cuda.nvfp4_tile.Config.fromEnv(); // TF_FLASHNEXT_PROMPT_EXPERT_TILE, refused before any load
     const mode = try config.mode(gpa, io, dir);
     if (o.tp != 1 and mode != .modelopt) return error.FlashNextRanksNeedModelopt;
     if (o.tp != 1 and captured != null) return error.FlashNextRanksOnCapturedGlue;

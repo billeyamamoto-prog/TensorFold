@@ -1,4 +1,5 @@
 // K32 expert staging adapted from MiaAI-Lab patch 0014; MIT notice in THIRD_PARTY_NOTICES.md.
+// NVFP4 prompt-chunk experts on shared-memory row tiles, the decode kernel's bits (TensorFold Contributors).
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -8,8 +9,8 @@
 
 namespace tf_nvfp4_tile {
 
-constexpr int BLOCK4 = 36;
-constexpr int XBYTES_PER_TILE = 2 * 32 * 16;
+constexpr int BLOCK4 = 36;  // uint4 a (32 columns, 32 inputs) block: 32 lanes' code words, then 4 of scales
+constexpr int XBYTES_PER_TILE = 2 * 32 * 16;  // a row tile's A fragments of one K32 group: (half, lane) 16-byte quads
 
 using tf_common::cp4;
 
@@ -17,6 +18,7 @@ using tf_common::fp4pair;
 
 using tf_common::e4m3f;
 
+// experts.cuh's mma with a fresh +0.0 accumulator in registers of its own (the same instruction)
 __device__ __forceinline__ void mma0(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) { qmm_frag::mma0(d, a0, a1, a2, a3, b0, b1); }
 
 template <int M>
@@ -25,6 +27,7 @@ struct WStage {
   uint4 s[M];
 };
 
+// One K32 group of a warp: each weight fragment and scale serves RT row tiles; every acc gets its fmaf in (g, h) order.
 template <int M, int RT>
 __device__ __forceinline__ void scompute(float (&acc)[M][RT][NTW][4], const WStage<M>& st, const char* xs, int lane) {
   uint4 xf[RT][2];
@@ -55,13 +58,14 @@ __device__ __forceinline__ void scompute(float (&acc)[M][RT][NTW][4], const WSta
         float(&a)[4] = acc[m][r][j];
         a[0] = fmaf(pp[g & 1][r][0], sc[g & 1][0], a[0]);
         a[1] = fmaf(pp[g & 1][r][1], sc[g & 1][1], a[1]);
-        a[2] = fmaf(pp[g & 1][r][2], sc[g & 1][0], a[2]);
+        a[2] = fmaf(pp[g & 1][r][2], sc[g & 1][0], a[2]);  // rows past the item's end compute garbage nobody stores
         a[3] = fmaf(pp[g & 1][r][3], sc[g & 1][1], a[3]);
       }
     }
   }
 }
 
+// Each output as the decode kernel's: p = mma(x, q) from +0.0, acc = fmaf(p, e4m3 scale, acc), then acc *= scale.
 template <int M, int EPI, int WARPS, int RT, int S>
 __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
                                        const uint4* blk, bool active, const float* __restrict__ scale, int e, int KG,
@@ -69,6 +73,7 @@ __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restri
                                        int cb, float limit, int tid, int lane, int gq, int t, int wp) {
   constexpr int NT = WARPS * 32, CP = (RT * 256 + NT - 1) / NT;
   constexpr int WSLAB = M * BLOCK4 * 16, XBYTES = 4 * XBYTES_PER_TILE, STRIDE = XBYTES + WARPS * WSLAB;
+  // X words: thread -> (row, word of the K32 slice) of the RT * 16 rows, 4 bytes at a time into fragment order
   const __nv_bfloat16* csrc[CP];
   int cdst[CP];
   bool cok[CP];
@@ -152,6 +157,7 @@ __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restri
   for (int r = 0; r < RT; ++r) epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
 }
 
+// RTMAX: row tiles of 16 pairs a pass (an item's tail takes fewer: 3, 2, 1)
 template <int M, int EPI, int WARPS, int RTMAX, int S>
 __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
                                           const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
@@ -193,6 +199,7 @@ __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, i
 
 }
 
+// 4 warps a CTA, S * (4 * 1024 + 4 * M * 576) dynamic shared bytes.
 #define TF_TILE4(NAME, M, EPI, RT, S)                                                                              \
   extern "C" __global__ void __launch_bounds__(128)                                                              \
       NAME(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,             \
@@ -204,3 +211,12 @@ __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, i
   }
 TF_TILE4(tf_nvfp4_tile_swiglu, 2, 2, 4, 4)
 TF_TILE4(tf_nvfp4_tile_down_f32, 1, 0, 2, 3)
+// the prompt tile's tuned instances, tf_nvfp4_tile_<gu|f32>_rt<RTMAX>_s<S> (nvfp4_tile.zig loads these by name)
+TF_TILE4(tf_nvfp4_tile_gu_rt4_s3, 2, 2, 4, 3)
+TF_TILE4(tf_nvfp4_tile_gu_rt4_s4, 2, 2, 4, 4)
+TF_TILE4(tf_nvfp4_tile_gu_rt2_s3, 2, 2, 2, 3)
+TF_TILE4(tf_nvfp4_tile_gu_rt2_s4, 2, 2, 2, 4)
+TF_TILE4(tf_nvfp4_tile_gu_rt3_s3, 2, 2, 3, 3)
+TF_TILE4(tf_nvfp4_tile_f32_rt4_s3, 1, 0, 4, 3)
+TF_TILE4(tf_nvfp4_tile_f32_rt4_s4, 1, 0, 4, 4)
+TF_TILE4(tf_nvfp4_tile_f32_rt2_s3, 1, 0, 2, 3)

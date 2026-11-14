@@ -57,6 +57,7 @@ pub const qk_rows = @import("qk_rows.zig");
 pub const experts = @import("experts.zig");
 pub const experts32 = @import("experts32.zig");
 pub const experts_waves = @import("experts_waves.zig");
+pub const nvfp4_tile = @import("nvfp4_tile.zig");
 pub const sample = @import("sample.zig");
 pub const rank_scatter = @import("rank_scatter.zig");
 pub const relay_plan = @import("relay_plan.zig");
@@ -115,6 +116,7 @@ test {
     _ = @import("experts.zig");
     _ = @import("experts32.zig");
     _ = @import("experts_waves.zig");
+    _ = nvfp4_tile;
     _ = @import("sample.zig");
     _ = @import("roce.zig");
     _ = @import("roce_nap.zig");

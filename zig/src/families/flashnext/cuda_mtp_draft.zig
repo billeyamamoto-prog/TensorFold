@@ -8,6 +8,7 @@ const prompt = @import("cuda_prompt.zig");
 const gdn = @import("cuda_gdn.zig");
 const mtp = @import("cuda_mtp.zig");
 const pages = @import("cuda_pages.zig");
+const kv_format = @import("cuda_kv.zig");
 
 const dims = wt.dims;
 const streams = wt.streams;
@@ -53,6 +54,8 @@ pub const Draft = struct {
     kc: cuda.DeviceBuffer,
     vc: cuda.DeviceBuffer,
     ikc: cuda.DeviceBuffer,
+    /// The format of kc and vc (the engine's --kv-cache).
+    kv: kv_format.Kv = .bf16,
     /// Its pooled indexer keys [cap / 4, 128] bf16, for sparse attention past 2,048 keys (Python State.mtp_pooled).
     pooled: cuda.DeviceBuffer,
     /// The cache's pages (a pool lane's: its stream's, the layer after the model's), or contiguous.
@@ -122,9 +125,14 @@ pub const Draft = struct {
 
     /// Device bytes `init(cap, draft_n, rows, h)` allocates: the head's cache at full KV rows, the rest at `h`.
     pub fn bytes(cap: usize, draft_n: usize, rows: usize, h: Heads) usize {
-        const l = Layout.of(h);
-        const head = 2 * sizes.kvBytes(cap, head_heads) + sizes.indexBytes(cap) + sizes.pooledBytes(cap);
+        return bytesFor(.bf16, cap, draft_n, rows, h);
+    }
+
+    /// bytes with the head's cache in format `format` (--kv-cache, cuda_kv.zig): its head rows in the format, the rest as `bytes`.
+    pub fn bytesFor(format: kv_format.Kv, cap: usize, draft_n: usize, rows: usize, h: Heads) usize {
+        const head = cap * format.keyRow() + cap * format.valueRow() + sizes.indexBytes(cap) + sizes.pooledBytes(cap);
         const log = if (late()) logBytes() else 0;
+        const l = Layout.of(h);
         return head + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + best_bytes + l.saved + linear_n * l.state + log;
     }
 
@@ -159,10 +167,15 @@ pub const Draft = struct {
 
     /// A head cache of `cap` entries; `rows` the widest prompt chunk whose streams it keeps; `h` the model's heads.
     pub fn init(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads) !Draft {
-        var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .host = undefined, .layout = .of(h) };
-        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        return initFor(.bf16, gpa, driver, stream, cap, draft_n, rows, h);
+    }
+
+    /// init with the head's cache in format `format` (--kv-cache, cuda_kv.zig).
+    pub fn initFor(format: kv_format.Kv, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads) !Draft {
+        var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .kv = format, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .host = undefined, .layout = .of(h) };
+        d.kc = try cuda.DeviceBuffer.alloc(driver, cap * format.keyRow());
         errdefer d.kc.free();
-        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.vc = try cuda.DeviceBuffer.alloc(driver, cap * format.valueRow());
         errdefer d.vc.free();
         d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
         errdefer d.ikc.free();
@@ -206,12 +219,17 @@ pub const Draft = struct {
 
     /// init's draft whose fixed-size buffers (partsBytes) are zeroed views of `block`; its caches allocated as init's.
     pub fn initParts(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, block: cuda.DeviceBuffer) !Draft {
+        return initPartsFor(.bf16, gpa, driver, stream, cap, draft_n, rows, h, block);
+    }
+
+    /// initParts with the head's cache in format `format` (--kv-cache, cuda_kv.zig).
+    pub fn initPartsFor(format: kv_format.Kv, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, block: cuda.DeviceBuffer) !Draft {
         const bytes_in = partsBytes(draft_n, rows, h);
         if (block.len < bytes_in) return error.FlashNextRunTooShort;
-        var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .spare = undefined, .host = undefined, .layout = .of(h) };
-        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .kv = format, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .spare = undefined, .host = undefined, .layout = .of(h) };
+        d.kc = try cuda.DeviceBuffer.alloc(driver, cap * format.keyRow());
         errdefer d.kc.free();
-        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.vc = try cuda.DeviceBuffer.alloc(driver, cap * format.valueRow());
         errdefer d.vc.free();
         d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
         errdefer d.ikc.free();
@@ -400,4 +418,12 @@ test "the saved pieces follow one another at the model's heads, and the spares h
     }
     try std.testing.expectEqual(@as(usize, 41_021_440), Draft.Layout.of(.full).saved);
     try std.testing.expectEqual(@as(usize, 20_930_560), Draft.Layout.of(.half).saved);
+}
+
+test "a head cache in fp8 takes 1,056 + 256 bytes a position, its pooled blocks and window buffers as in bf16" {
+    for ([_]usize{ 1, 4, 5, 8192 }) |cap| {
+        try std.testing.expectEqual(Draft.bytes(cap, 100, 64, .full), Draft.bytesFor(.bf16, cap, 100, 64, .full));
+        try std.testing.expectEqual(cap * (2048 - 1056), Draft.bytesFor(.bf16, cap, 100, 64, .full) - Draft.bytesFor(.fp8, cap, 100, 64, .full));
+    }
+    try std.testing.expectEqual(@as(usize, 1056 + 256), Draft.bytesFor(.fp8, 6, 1, 1, .full) - Draft.bytesFor(.fp8, 5, 1, 1, .full));
 }

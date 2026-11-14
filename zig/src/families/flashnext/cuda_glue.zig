@@ -81,6 +81,11 @@ const Fns = struct {
     merge_lanes: cuda.Function,
     chunks_one_paged: cuda.Function,
     fused_paged: cuda.Function,
+    // --kv-cache fp8 (cuda_kv.zig): the same launches over e4m3 rows, on the engine's own contiguous caches
+    prep_kv8: cuda.Function,
+    prep_media_kv8: cuda.Function,
+    chunks_kv8: cuda.Function,
+    fused_kv8: cuda.Function,
 };
 
 /// The captured entry points our glue replaces, by Triton name (TF_FLASHNEXT_OWNED lists them).
@@ -175,6 +180,10 @@ pub const Glue = struct {
             .merge_lanes = try g.attn.function("fn_attn_merge_lanes"),
             .chunks_one_paged = try g.attn.function("fn_attn_chunks_one_paged"),
             .fused_paged = try g.attn.function("fn_attn_fused_paged"),
+            .prep_kv8 = try g.attn.function("fn_attn_prep_kv8"),
+            .prep_media_kv8 = try g.attn.function("fn_attn_prep_media_kv8"),
+            .chunks_kv8 = try g.attn.function("fn_attn_chunks_kv8"),
+            .fused_kv8 = try g.attn.function("fn_attn_fused_kv8"),
         };
         try g.f.chunks.allowDynamicShared(chunkSmem(1));
         try g.f.chunks_ahead.allowDynamicShared(chunkSmem(2));
@@ -184,6 +193,8 @@ pub const Glue = struct {
         try g.f.chunks_lanes.allowDynamicShared(chunkSmem(2));
         try g.f.chunks_one_paged.allowDynamicShared(oneSmem());
         try g.f.fused_paged.allowDynamicShared(oneSmem());
+        try g.f.chunks_kv8.allowDynamicShared(oneSmem());
+        try g.f.fused_kv8.allowDynamicShared(oneSmem());
         return g;
     }
 
@@ -241,18 +252,41 @@ pub const Glue = struct {
 
     /// Text positions, a bf16 cache: the layer's heads `h` and the whole indexer normed, roped and stored.
     pub fn attnPrep(g: *const Glue, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize, h: Heads, pg: Pg) !void {
+        return prepOn(g, s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows, h, pg, false);
+    }
+
+    /// attnPrep into fp8 caches (cuda_kv.zig): kc [cap, kv_heads, 272] and vc [cap, kv_heads, 256] bytes, each KV head's
+    /// key and value row quantized with its own power-of-two scales by the head's program. The fp8 rows are the engine's
+    /// own contiguous caches: a stream taking pages from the pool has no fp8 kernel, so a paged stream refuses.
+    pub fn attnPrepKv8(g: *const Glue, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize, h: Heads, pg: Pg) !void {
+        if (pg.pt != 0) return error.PagedKv8;
+        return prepOn(g, s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows, h, pg, true);
+    }
+
+    fn prepOn(g: *const Glue, s: cuda.Stream, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize, h: Heads, pg: Pg, kv8: bool) !void {
         if (wt.head_dim != tile_head_dim) return error.RowShape;
         var a: cuda.Args = .{};
         ptrs(&a, &.{ proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc });
         a.add(eps);
         ints(&a, &.{ h.projN(), h.q, h.kv, wt.index_heads, wt.index_dim, wt.half });
         if (pg.pt != 0) a.add(pg);
-        const f = if (pg.pt != 0) g.f.prep_paged else g.f.prep;
+        const f = if (kv8) g.f.prep_kv8 else if (pg.pt != 0) g.f.prep_paged else g.f.prep;
         try go(f, s, .{ rows, h.q + h.kv + wt.index_heads + 1, 1 }, tile_head_dim, 0, &a);
     }
 
     /// Attention over 512-key chunks; `qsa` the sparse form (NCH 5, rows' key lists), else dense (NCH 3).
     pub fn attnChunks(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, chunks: usize, qsa: bool, pg: Pg) !void {
+        return chunksOn(g, s, q, kc, vc, pos, po, pm, pl, ids, nk, sparse, rows, h, chunks, qsa, pg, false);
+    }
+
+    /// attnChunks over fp8 caches: one buffer a tile whatever the rows (the codes are widened as they are staged).
+    /// The fp8 kernel has no page table: a stream taking pages from the pool refuses.
+    pub fn attnChunksKv8(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, chunks: usize, qsa: bool, pg: Pg) !void {
+        if (pg.pt != 0) return error.PagedKv8;
+        return chunksOn(g, s, q, kc, vc, pos, po, pm, pl, ids, nk, sparse, rows, h, chunks, qsa, pg, true);
+    }
+
+    fn chunksOn(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, chunks: usize, qsa: bool, pg: Pg, kv8: bool) !void {
         const kv: usize = h.kv;
         const group = h.q / kv;
         if (group > tile_heads) return error.RowShape;
@@ -262,6 +296,10 @@ pub const Glue = struct {
         a.add(@as(f32, 0.0625));
         ints(&a, &.{ wt.index_idw, @intFromBool(qsa) });
         if (pg.pt != 0) a.add(pg);
+        if (kv8) {
+            try go(g.f.chunks_kv8, s, .{ rows, kv, chunks }, 128, oneSmem(), &a);
+            return;
+        }
         const ahead = rows <= ahead_rows;
         const f = if (ahead) g.f.chunks_ahead else g.f.chunks_one;
         const paged = if (ahead) g.f.chunks_ahead_paged else g.f.chunks_one_paged;
@@ -270,6 +308,16 @@ pub const Glue = struct {
 
     /// Prompt rows' attention with every chunk merged in the program (fn_attn_fused): out bf16, attnChunks then
     pub fn attnFused(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, pg: Pg) !void {
+        return fusedOn(g, s, q, kc, vc, pos, out, ids, nk, sparse, rows, h, pg, false);
+    }
+
+    /// attnFused over fp8 caches (the same refusal as attnChunksKv8).
+    pub fn attnFusedKv8(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, pg: Pg) !void {
+        if (pg.pt != 0) return error.PagedKv8;
+        return fusedOn(g, s, q, kc, vc, pos, out, ids, nk, sparse, rows, h, pg, true);
+    }
+
+    fn fusedOn(g: *const Glue, s: cuda.Stream, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, pg: Pg, kv8: bool) !void {
         const kv: usize = h.kv;
         const group = h.q / kv;
         if (group > tile_heads) return error.RowShape;
@@ -279,6 +327,10 @@ pub const Glue = struct {
         a.add(@as(f32, 0.0625));
         ints(&a, &.{ wt.index_idw, 1 });
         if (pg.pt != 0) a.add(pg);
+        if (kv8) {
+            try go(g.f.fused_kv8, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);
+            return;
+        }
         try go(if (pg.pt != 0) g.f.fused_paged else g.f.fused, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);
     }
 

@@ -26,7 +26,7 @@ pub fn Snaps(comptime Cuda: type) type {
             const inpass = forms.in_pass and self.ranks == null and l.seq.media == null and forms.gdn_fused;
             for (s.reuse.marks) |m| if (m > at and m < stop0) {
                 if (inpass and n < parts.max_marks) {
-                    if (snap.prepare(self.gpa, self.engine.driver, m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads)) |p| {
+                    if (snap.prepare(self.gpa, self.engine.driver, m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads, l.seq.kv)) |p| {
                         l.prepared[n] = p;
                         marks[n] = .{ .at = m, .base = p.buf.ptr };
                         n += 1;
@@ -58,7 +58,7 @@ pub fn Snaps(comptime Cuda: type) type {
         }
 
         pub fn bytes(ptr: *anyopaque, at: u32) u64 {
-            return snap.bytes(at, of(ptr).head != null, of(ptr).engine.heads);
+            return snap.bytesFor(of(ptr).engine.kv, at, of(ptr).head != null, of(ptr).engine.heads);
         }
 
         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).

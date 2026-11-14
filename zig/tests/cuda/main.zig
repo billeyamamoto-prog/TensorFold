@@ -107,6 +107,7 @@ const lane_half_tests = @import("lane_half_tests.zig");
 const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
+const flashnext_kv8_tests = @import("flashnext_kv8_tests.zig");
 const ggml_tests = @import("ggml_tests.zig");
 const paged_tests = @import("paged_tests.zig");
 const glm_loader_gate = @import("glm_loader_gate.zig");
@@ -156,6 +157,7 @@ const usage =
     \\  flashnext-gdn-heads [BASELINE]  DeltaNet full/half bytes, optionally against a frozen flashnext_batch.fatbin
     \\  flashnext-tp-heads MODEL  each rank's cut in-projections and attention heads equal the whole layer's bytes
     \\  flashnext-pages           the attention glue's caches through a page table: paged == contiguous, float64, controls
+    \\  flashnext-kv8             Flash Next's --kv-cache fp8 write against its format model and its reads against the bf16 kernels (synthetic)
     \\  info                      driver, device and library versions
     \\  smoke                     copies, fills, launches, argument packing, module globals
     \\  shared-context            Context.shared and Stream.borrowed as a library inside a host's process sees them
@@ -402,6 +404,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-pages")) return @import("contract_fn_pages.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-attn-lanes")) return @import("contract_fn_attn_lanes.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-readout-cut")) return @import("flashnext_readout_cut.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "flashnext-kv8")) return flashnext_kv8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
     if (std.mem.eql(u8, cmd, "shared-context")) return runtime_tests.sharedContext(gpu);

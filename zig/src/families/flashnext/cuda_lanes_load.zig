@@ -7,6 +7,7 @@ const ranks = @import("cuda_rank_engine.zig");
 const config = @import("cuda_config.zig");
 const Glue = @import("cuda_glue.zig").Glue;
 const images = @import("cuda_images.zig");
+const Heads = @import("cuda_heads.zig").Heads;
 pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: F.Options) !F.Loaded {
     try @import("env_validate.zig").startup();
     if (o.vision) |v| try @import("qwen_vision").media.checkLimits(v);
@@ -36,6 +37,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     const late_fits = o.tp == 1;
     if (Draft.lateWanted() == true and !late_fits) return error.FlashNextKeepLateUnsupported;
     Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
+    // --kv-cache fp8 (cuda_kv.zig) is written and read by our own glue on one rank, and the learner's passes keep bf16
+    if (o.kv8 and (o.tp != 1 or captured != null or o.slide)) return error.Fp8KvUnsupported;
     const driver: *cuda.Driver = @constCast(ctx.d);
     const own = try gpa.create(Cuda);
     errdefer gpa.destroy(own);
@@ -65,6 +68,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     };
     own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
     own.engine.chunk = chunk;
+    own.engine.kv = if (o.kv8) .fp8 else .bf16;
     if (own.ranks) |r| {
         r.engine = own.engine;
         own.engine.collective = &r.collective;
@@ -77,6 +81,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (own.set != null) return error.VisionCapturedSetUnsupported;
         own.vision = try images.Vision.load(gpa, io, driver, own.stream, dir, limits, o.rank, own.glue.f.prep_media, own.glue.f.pool_media, own.glue.f.prep_media_paged, own.glue.f.pool_media_paged);
         own.engine.image_factory = own.vision;
+        if (o.kv8) own.vision.?.prep8 = own.glue.f.prep_media_kv8;
     }
     errdefer if (own.vision) |v| v.deinit();
     // the pass's scratch for a full chunk, once for the engine (every prompt, window, round and head pass)
@@ -101,10 +106,11 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     own.lanes = .empty;
     own.next = 0;
     if (o.slide) own.lay = try @import("cuda_slide.zig").layoutOf(gpa, io, dir);
-    const own_seq_bytes = try prompt.seqBytesPaged(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads);
+    const own_seq_bytes = if (own.engine.kv == .fp8) prompt.seqBytesFor(own.engine.kv, window) else try prompt.seqBytesPaged(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads);
     var stream_bytes = own_seq_bytes;
     if (own.head) |h| {
-        stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+        // the head's cache and window in the engine's format (cuda_kv.zig): our own glue wrote and reads them so
+        stream_bytes += if (own.engine.kv == .fp8) mtp.Draft.bytesFor(own.engine.kv, window, h.ids.len, own.engine.chunk) else mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
     } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
     if (page_tokens > 0) {
@@ -146,4 +152,21 @@ pub fn comparison(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, ctx:
     set.deinit();
     std.log.info("flashnext: the captured set at {s} lacks Flash Next's kernels; its own glue runs", .{dir});
     return null;
+}
+
+/// Device bytes each admitted stream allocates at a `window`-token cache: its sequence and, with the MTP head (`head_ids` its
+/// draft vocabulary, null without it), the head's cache and window buffers.
+pub fn streamBytes(kv: prompt.kv_format.Kv, window: usize, head_ids: ?usize, chunk: usize, tp_head: bool) usize {
+    // an fp8 cache runs on one rank at whole heads; a bf16 one sizes by the rank's heads (tensor parallel's half)
+    const h: Heads = if (tp_head) .half else .full;
+    var n = if (kv == .fp8) prompt.seqBytesFor(kv, window) else prompt.seqBytes(window, h);
+    if (head_ids) |ids| {
+        n += if (kv == .fp8) mtp.Draft.bytesFor(kv, window, ids, chunk) else mtp.Draft.bytes(window, ids, chunk, h);
+    } else if (tp_head) n += mtp.Draft.bytes(window, 1, chunk, h);
+    return n;
+}
+
+/// A stream's image rows: the features it holds and 16 bytes of each context position's row bookkeeping.
+fn visionStreamBytes(v: anytype, context: usize) usize {
+    return @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * context;
 }

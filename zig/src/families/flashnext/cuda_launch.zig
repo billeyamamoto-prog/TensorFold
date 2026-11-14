@@ -32,6 +32,10 @@ pub const ple = @import("cuda_ple.zig");
 pub const ple_check = @import("cuda_ple_check.zig");
 pub const mix = @import("cuda_mix.zig");
 pub const prompt = @import("cuda_prompt.zig");
+/// The attention caches' formats (--kv-cache), a state's bytes in each, and a stream's at the window
+pub const kv_format = @import("cuda_kv.zig");
+pub const snap = @import("cuda_snap.zig");
+pub const lanes_load = @import("cuda_lanes_load.zig");
 /// The row-by-row reference path, for flashnext-prompt
 pub const row_path = @import("cuda_rows.zig");
 /// The MTP head's drafts: its forward, the chain, the verify window's rows and their rollback
@@ -327,6 +331,27 @@ pub const Tri = struct {
     /// Whether every launch that reads or writes the caches is ours, so a stream's caches may be paged.
     pub fn pagesOwned(t: Tri) bool {
         return t.glue("_attn_prep") != null and t.glue("_pool") != null and t.glue("_scores") != null and t.glue("_chunks") != null;
+    }
+
+    /// attnPrep into fp8 caches (--kv-cache fp8, cuda_kv.zig), text positions; ours only: no captured set writes them.
+    pub fn attnPrepKv8(t: Tri, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, eps: f32, rows: usize, h: Heads, pg: Pg) !void {
+        const g = t.own orelse return error.NoGlue;
+        if (t.set != null) return error.Fp8KvUnsupported;
+        return g.attnPrepKv8(t.s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows, h, pg);
+    }
+
+    /// attnChunks over fp8 caches, ours only.
+    pub fn attnChunksKv8(t: Tri, q: u64, kc: u64, vc: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, chunks: usize, qsa: bool, pg: Pg) !void {
+        const g = t.own orelse return error.NoGlue;
+        if (t.set != null) return error.Fp8KvUnsupported;
+        return g.attnChunksKv8(t.s, q, kc, vc, pos, po, pm, pl, ids, nk, sparse, rows, h, chunks, qsa, pg);
+    }
+
+    /// attnFused over fp8 caches, ours only.
+    pub fn attnFusedKv8(t: Tri, q: u64, kc: u64, vc: u64, pos: u64, out: u64, ids: u64, nk: u64, sparse: u64, rows: usize, h: Heads, pg: Pg) !void {
+        const g = t.own orelse return error.NoGlue;
+        if (t.set != null) return error.Fp8KvUnsupported;
+        return g.attnFusedKv8(t.s, q, kc, vc, pos, out, ids, nk, sparse, rows, h, pg);
     }
 
     /// qmm.hc_down for one decode row. N=324 is the layer down stacked with inject. M folds when it is 1.

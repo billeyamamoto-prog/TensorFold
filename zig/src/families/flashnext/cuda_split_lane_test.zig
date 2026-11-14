@@ -268,6 +268,7 @@ test "shared expert composition keeps whole direct slots and split full-K output
         m: parts.Model,
         stream: cuda.Stream,
         prompt: bool = false,
+        hooks: batch.Hooks = .{},
         tri: struct { own: ?*SharedGlue },
     };
     // the lane's 128-row tile loaded (from qmmf.prompt_rows rows): the whole down still goes direct at 512 rows

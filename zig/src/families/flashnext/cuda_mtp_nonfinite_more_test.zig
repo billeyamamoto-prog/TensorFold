@@ -76,7 +76,7 @@ test "Flash Next nonfinite: draftMany drives two lanes through the actual shared
     try t.expectEqual(h.ids[2], second.tokens[0]);
     D.reset();
     reduced[1] = f.reduction(-std.math.inf(f32), std.math.nan(f32), std.math.maxInt(i32));
-    try t.expectError(error.ProposalNonfinite, ops.draftMany(flow, &.{ &x, &y }, &.{ &.{11}, &.{12} }, &.{ 9, 10 }, &.{ 1, 1 }, &.{ 8, 8 }, &.{ null, null }, &.{ 0, 0 }, &.{ &first, &second }));
+    try t.expectError(error.ProposalNonfinite, ops.draftMany(flow, &.{ &x, &y }, &.{ &.{11}, &.{12} }, &.{ 9, 10 }, &.{ 1, 1 }, &.{ 8, 8 }, &.{ null, null }, &.{ 0, 0 }, &.{ &first, &second }, null));
     try t.expectEqual(@as(usize, 2), calls);
     try t.expectEqual(@as(usize, 2), D.best_calls);
     try t.expectEqual(@as(usize, 0), second.n);

@@ -112,7 +112,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     var stream_bytes = own_seq_bytes;
     if (own.head) |h| {
         // the head's cache and window in the engine's format (cuda_kv.zig): our own glue wrote and reads them so
-        stream_bytes += if (own.engine.kv == .fp8) mtp.Draft.bytesFor(own.engine.kv, window, h.ids.len, own.engine.chunk) else mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
+        stream_bytes += if (own.engine.kv == .fp8) mtp.Draft.bytesFor(own.engine.kv, window, h.ids.len, own.engine.chunk, own.engine.heads) else mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
     } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
     if (page_tokens > 0) {
@@ -163,7 +163,7 @@ pub fn streamBytes(kv: prompt.kv_format.Kv, window: usize, head_ids: ?usize, chu
     const h: Heads = if (tp_head) .half else .full;
     var n = if (kv == .fp8) prompt.seqBytesFor(kv, window) else prompt.seqBytes(window, h);
     if (head_ids) |ids| {
-        n += if (kv == .fp8) mtp.Draft.bytesFor(kv, window, ids, chunk) else mtp.Draft.bytes(window, ids, chunk, h);
+        n += if (kv == .fp8) mtp.Draft.bytesFor(kv, window, ids, chunk, h) else mtp.Draft.bytes(window, ids, chunk, h);
     } else if (tp_head) n += mtp.Draft.bytes(window, 1, chunk, h);
     return n;
 }

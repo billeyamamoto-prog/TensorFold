@@ -58,7 +58,8 @@ pub fn Snaps(comptime Cuda: type) type {
         }
 
         pub fn bytes(ptr: *anyopaque, at: u32) u64 {
-            return snap.bytesFor(of(ptr).engine.kv, at, of(ptr).head != null, of(ptr).engine.heads);
+            // a state is sized by the larger head cache a stream may hold
+            return snap.bytesWith(of(ptr).engine.kv, if (of(ptr).head != null) .bf16 else null, at, of(ptr).engine.heads);
         }
 
         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).

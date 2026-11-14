@@ -15,7 +15,7 @@ pub fn size(k: anytype, n: usize) usize {
 }
 
 /// The patch's tuned launcher (nvfp4_tile.zig) takes gate/up of an n-row chunk of a rank group of `world`: its plan pairs; null: the upstream path.
-pub fn patchedGu(k: anytype, n: usize, world: usize) ?*cuda.nvfp4_tile.Tile {
+pub fn patchedGu(k: anytype, n: usize, world: usize) ?*const cuda.nvfp4_tile.Tile {
     if (k.patched_tile) |*t| {
         if (t.cfg.applies(n, world)) return t;
     }
@@ -23,7 +23,7 @@ pub fn patchedGu(k: anytype, n: usize, world: usize) ?*cuda.nvfp4_tile.Tile {
 }
 
 /// The patch's launcher takes down of such a chunk only in mode 2.
-pub fn patchedDn(k: anytype, n: usize, world: usize) ?*cuda.nvfp4_tile.Tile {
+pub fn patchedDn(k: anytype, n: usize, world: usize) ?*const cuda.nvfp4_tile.Tile {
     if (k.patched_tile) |*t| {
         if (t.cfg.appliesDown(n, world)) return t;
     }

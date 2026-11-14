@@ -94,13 +94,16 @@ const Way = enum { save, restore, rows };
 /// A piece `move` copies: `layers` buffers of `n` bytes, rows of `row` bytes (0: whole) a `per`-position block each.
 pub const Piece = struct { layers: usize, n: usize, row: usize = 0, per: usize = 1 };
 
+/// `move`'s ordered pieces: up to 11 of them.
+pub const Order = struct { p: [11]Piece, len: usize };
+
 /// `move`'s pieces in order at `at` and the model's heads `h` (the disk image's at full): DeltaNet, attention, tail.
-pub fn order(at: usize, head: bool, h: Heads) struct { p: [11]Piece, len: usize } {
+pub fn order(at: usize, head: bool, h: Heads) Order {
     return orderFor(.bf16, at, head, h);
 }
 
 /// `move`'s pieces in order at `at`, the model's heads `h` and the caches' format `format`: DeltaNet, attention, tail.
-pub fn orderFor(format: Kv, at: usize, head: bool, h: Heads) struct { p: [11]Piece, len: usize } {
+pub fn orderFor(format: Kv, at: usize, head: bool, h: Heads) Order {
     var o: [11]Piece = undefined;
     o[0] = .{ .layers = wt.linear_n, .n = sizes.convBytes(h) };
     o[1] = .{ .layers = wt.linear_n, .n = sizes.stateBytes(h) };

@@ -48,6 +48,9 @@ const Fake = struct {
     pub fn attnPrep(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, pg: flash.Pg) !void {
         try std.testing.expectEqual(C.expected_pg, pg);
     }
+    pub fn attnPrepKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, pg: flash.Pg) !void {
+        try std.testing.expectEqual(C.expected_pg, pg);
+    }
     pub fn qsaPool(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, pg: flash.Pg) !void {
         try std.testing.expectEqual(C.expected_pg, pg);
     }

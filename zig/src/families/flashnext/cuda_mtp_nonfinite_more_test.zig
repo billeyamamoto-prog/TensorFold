@@ -66,7 +66,7 @@ test "Flash Next nonfinite: draftMany drives two lanes through the actual shared
     D.reductions = &reduced;
     var first: mtp.Chain = .{};
     var second: mtp.Chain = .{};
-    try ops.draftMany(flow, &.{ &x, &y }, &.{ &.{11}, &.{12} }, &.{ 9, 10 }, &.{ 1, 1 }, &.{ 8, 8 }, &.{ null, null }, &.{ 0, 0 }, &.{ &first, &second });
+    try ops.draftMany(flow, &.{ &x, &y }, &.{ &.{11}, &.{12} }, &.{ 9, 10 }, &.{ 1, 1 }, &.{ 8, 8 }, &.{ null, null }, &.{ 0, 0 }, &.{ &first, &second }, null);
     try t.expectEqual(@as(usize, 1), calls);
     try t.expectEqual(@as(usize, 2), lanes);
     try t.expectEqualSlices(u64, &.{ 0x3000, 0x3400 }, D.sources[0..D.best_calls]);

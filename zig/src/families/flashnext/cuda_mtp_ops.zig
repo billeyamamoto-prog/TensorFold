@@ -13,6 +13,7 @@ const roll = @import("cuda_mtp_roll.zig");
 const pieces = @import("cuda_mtp_pieces.zig");
 const draw = @import("cuda_mtp_draw.zig");
 const module = @This();
+const ple = @import("cuda_ple.zig");
 
 /// One group of lanes in the batched head's pass: the lanes' drafts, their rows and whether the head scores.
 const Group = struct {
@@ -179,9 +180,10 @@ pub fn Ops(comptime Tri: type) type {
         }
 
         /// Python decode.draft: absorb the kept rows, then chain up to `count` drafts under mtp.Stop, the first kept.
-        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain) !void {
+        pub fn draft(o: Self, d: *Draft, next: []const u32, rows: u64, position: u64, count: usize, sm: ?Sampling, confidence: f64, out: *Chain, ahead: ?*ple.Ahead) !void {
             out.n = 0;
             try o.absorb(d, next, rows, count > 0);
+            if (ahead) |a| a.flush();
             var stop: mtp.Stop = .{ .c = confidence };
             var j: usize = 0;
             while (j < @min(count, max_chain)) : (j += 1) {
@@ -191,12 +193,16 @@ pub fn Ops(comptime Tri: type) type {
                 out.tokens[out.n] = got.token;
                 out.probs[out.n] = got.prob;
                 out.n += 1;
+                if (ahead) |a| a.push(0, got.token);
                 if (!t.more) break;
                 if (j + 1 < count) {
                     try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                    // asked once the head's step is on the stream: the reads run while it does
+                    if (ahead) |a| a.flush();
                     d.drafted += 1;
                 }
             }
+            if (ahead) |a| a.flush();
         }
 
         /// forwardHead over several drafts in one pass, a lane each: every row's ops and sums as a lone forwardHead's.
@@ -270,8 +276,8 @@ pub fn Ops(comptime Tri: type) type {
         }
 
         /// Draft several lanes through the shared operator loop.
-        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, positions: []const u64, sms: []const ?Sampling, confidences: []const f64, outs: []const *Chain) !void {
-            return module.draftMany(o, ds, nexts, rows, counts, positions, sms, confidences, outs);
+        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, positions: []const u64, sms: []const ?Sampling, confidences: []const f64, outs: []const *Chain, ahead: ?*ple.Ahead) !void {
+            return module.draftMany(o, ds, nexts, rows, counts, positions, sms, confidences, outs, ahead);
         }
 
         /// One forward over the window `ids` from seq.fed: each row's scores in d.logits, its streams in d.streams.
@@ -421,7 +427,7 @@ test "a grouped head's lane carries its draft's page table" {
 }
 
 /// One shared head loop over its operator boundary: forward work, reductions, guarded picks and stop policy.
-pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, positions: []const u64, sms: []const ?Sampling, confidences: []const f64, outs: []const *Chain) !void {
+pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, positions: []const u64, sms: []const ?Sampling, confidences: []const f64, outs: []const *Chain, ahead: ?*ple.Ahead) !void {
     const h = o.h;
     const n_l = ds.len;
     for (ds, outs) |d, out| {
@@ -432,6 +438,7 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
         }
     }
     try o.forwardHeadMany(ds, nexts, rows, true);
+    if (ahead) |a| a.flush();
     var act: [max_lanes]usize = undefined;
     var n_act: usize = 0;
     for (counts, 0..) |c, i| if (c > 0) {
@@ -460,6 +467,7 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
             out.tokens[out.n] = got.token;
             out.probs[out.n] = got.prob;
             out.n += 1;
+            if (ahead) |a| a.push(i, got.token);
             if (!t.more) continue;
             if (j + 1 < @min(counts[i], max_chain)) {
                 step_ds[n_step] = ds[i];
@@ -475,6 +483,8 @@ pub fn draftMany(o: anytype, ds: []const *Draft, nexts: []const []const u32, row
             try o.forwardHeadMany(step_ds[0..n_step], step_nexts[0..n_step], step_rows[0..n_step], true);
             for (step_ds[0..n_step]) |d| d.drafted += 1;
         }
+        // asked once the step is on the stream: the reads run while it does
+        if (ahead) |a| a.flush();
         n_act = next_act;
     }
     _ = n_l;

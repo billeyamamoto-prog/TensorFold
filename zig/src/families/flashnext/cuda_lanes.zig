@@ -7,6 +7,9 @@ const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const mtp_ops = @import("cuda_mtp_ops.zig");
 const lanes_draft = @import("cuda_lanes_draft.zig");
+const ple = @import("cuda_ple.zig");
+const ple_reader = @import("cuda_ple_reader.zig");
+const planStop = @import("cuda_prompt_chunks.zig").planStop;
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
 const Glue = @import("cuda_glue.zig").Glue;
@@ -138,6 +141,8 @@ pub fn Namespace(comptime Tri: type) type {
             chain: mtp.Chain = .{},
             /// The prompt's next row while its pass runs a chunk a call; null once the prompt is in.
             filled: ?usize = 0,
+            /// The prompt row up to which the n-gram rows have been asked for ahead (TF_FLASHNEXT_WARM_AHEAD=1).
+            ahead_to: usize = 0,
             /// Where its caches came from: the pool's lanes, or its own (the one a pool leaves beside it).
             from: kvl.From = .none,
             /// Its sequence's and draft's fixed-size buffers' blocks (Parts), given back when it drops.
@@ -334,6 +339,25 @@ pub fn Namespace(comptime Tri: type) type {
                 }
                 return l;
             }
+            /// The n-gram rows of the chunk after [at, stop) (and of this one, the first time) read in the background while this chunk runs.
+            fn warmNext(self: *Cuda, l: *Lane, ids: []const u32, at: usize, stop: usize) void {
+                const g = &self.engine.ngram;
+                const n1 = g.hash.n - 1;
+                if (g.reader == null or n1 != l.seq.history.len) return;
+                const to = if (stop < ids.len) planStop(self.engine.chunk, ids.len, stop, &.{}, ple_reader.prefillTail()) else stop;
+                const from = @max(l.ahead_to, at);
+                if (from >= to) return;
+                var hist: [ple.max_n]i64 = undefined;
+                if (from == at) {
+                    @memcpy(hist[0..n1], l.seq.history[0..]);
+                } else {
+                    if (from < n1) return;
+                    for (0..n1) |k| hist[k] = ids[from - n1 + k];
+                }
+                g.aheadChunk(hist[0..n1], ids[from..to]);
+                l.ahead_to = to;
+            }
+
             /// One prompt chunk, rows picked as it starts, cut at a mark it cannot keep on the way; true once the last.
             fn step(self: *Cuda, s: *lanes.Stream, l: *Lane, _: u32) !bool {
                 const ids = s.prompt();
@@ -345,9 +369,12 @@ pub fn Namespace(comptime Tri: type) type {
                 const rows = @import("cuda_chunk.zig").passRows(&self.lanes, s, self.engine.chunk, self.engine.busy_chunk);
                 var marks: [prompt.batch.max_marks]prompt.batch.Mark = .{ .{}, .{} };
                 defer snaps.dropPrepared(self, l);
-                const cut = snaps.cut(self, s, l, ids, at, @min(ids.len, at + rows), &marks);
+                // the tail rule (TF_FLASHNEXT_PREFILL_TAIL): a last chunk under it takes half of the one before; the snaps cut at marks
+                const cut = snaps.cut(self, s, l, ids, at, planStop(rows, ids.len, at, &.{}, ple_reader.prefillTail()), &marks);
                 const last = cut.stop == ids.len;
-                self.engine.ngram.warmAhead(ids, cut.stop, @min(ids.len, cut.stop + rows));
+                // with the table on the threaded reader the rows are asked for ahead here; the hint would only pull pages in
+                if (self.engine.ngram.reader == null) self.engine.ngram.warmAhead(ids, cut.stop, @min(ids.len, cut.stop + rows));
+                if (ple_reader.warmAhead()) self.warmNext(l, ids, at, cut.stop);
                 if (l.draft) |*d| {
                     try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
                 } else if (self.ranks) |r| {
@@ -534,13 +561,18 @@ pub fn Namespace(comptime Tri: type) type {
                 if (r.position != l.seq.fed + 1) return error.PositionMismatch;
                 // the window's rows past the cache's room cannot run: fewer drafts there
                 const count = @min(@min(r.depth, mtp.depthFor(r.stream.sampling, self.depth, rule.greedy)), l.seq.cap - l.seq.fed - 1);
+                var ahead_buf = ple.Ahead.init(&self.engine.ngram);
+                const ahead: ?*ple.Ahead = if (ahead_buf) |*a| a else null;
+                if (ahead) |a| a.lane(0, l.seq.history[0..]);
                 if (r.rows) |path| {
                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                     if (r.follow.len < path.len) return error.PositionMismatch;
-                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, lanes_draft.stopFor(self, rule, r.stream.sampling), &l.chain);
+                    if (ahead) |a| a.push(0, r.follow[path.len - 1]);
+                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, lanes_draft.stopFor(self, rule, r.stream.sampling), &l.chain, ahead);
                 } else {
                     const first = self.value(r.first orelse return error.NoFirstToken);
-                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, lanes_draft.stopFor(self, rule, r.stream.sampling), &l.chain);
+                    if (ahead) |a| a.push(0, first);
+                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, lanes_draft.stopFor(self, rule, r.stream.sampling), &l.chain, ahead);
                 }
             }
         }

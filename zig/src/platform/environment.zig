@@ -194,6 +194,18 @@ pub const rules = [_]Rule{
     .{ .name = "TF_FLASHNEXT_KV_PAGE_TEST", .scope = .flashnext, .kind = .size, .forms = "a page size the kernels take, whole blocks of the indexer's ratio up to the window (unset: off)" },
     .{ .name = "TF_FLASHNEXT_CONFIDENCE", .scope = .flashnext, .kind = .signed_real, .forms = "a finite number (default -0.4)" },
     .{ .name = "TF_FLASHNEXT_PROMPT", .scope = .flashnext, .kind = .word, .words = &.{"rows"}, .forms = "rows for the rows path (unset or blank keeps the plain path)" },
+    .{ .name = "TF_FLASHNEXT_GATHER_READ", .scope = .flashnext, .kind = .word, .words = &.{"pread"}, .forms = "pread for the NVFP4 table's rows by positional reads through a row cache (unset or blank keeps the mapping's page faults)" },
+    .{ .name = "TF_FLASHNEXT_PREFILL_TAIL", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (0: no tail rule)" },
+    .{ .name = "TF_FLASHNEXT_GATHER_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_HC2", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_DRAFT_AHEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; needs GATHER_READ=pread)" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_SHARED_DIRECT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_GEMM2", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_SAMPLE_CAND", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_HOST_DRAW_THREADS", .scope = .flashnext, .kind = .u32, .max = 31, .forms = "a whole worker-thread count from 0 to 31 (0 draws on the engine thread alone)" },
+    .{ .name = "TF_FLASHNEXT_HEAD_PIECE", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (default 256; 0 takes the default)" },
+    .{ .name = "TF_FLASHNEXT_PRODUCT_STREAMS", .scope = .flashnext, .kind = .size, .forms = "a whole stream count from 0 to the native size maximum (default 2)" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERT_TILE_ROWS", .scope = .flashnext, .kind = .size, .forms = "a whole row count from 0 to the native size maximum (a chunk's fewest rows that take the expert tile kernel; the reader refuses 0)" },
 };
 
 pub fn rule(name: []const u8) Rule {

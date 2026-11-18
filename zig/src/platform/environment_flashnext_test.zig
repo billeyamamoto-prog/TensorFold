@@ -33,13 +33,38 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
 }
 
-test "Flash Next strict env: the table holds all 29 settings: 20 switches, 7 integers, 1 real, 1 structured" {
+test "Flash Next strict env: the table holds all 41 settings: 26 switches, 12 integers, 1 real, 2 structured" {
     var counts: [4]usize = @splat(0);
     for (e.rules) |r| if (r.scope == .flashnext) {
         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
         counts[@backingInt(group(r))] += 1;
     };
-    try t.expectEqual([4]usize{ 20, 7, 1, 1 }, counts);
+    try t.expectEqual([4]usize{ 26, 12, 1, 2 }, counts);
+}
+
+test "Flash Next strict env: the perf rows parse the values the running container ships" {
+    const Kept = struct { name: []const u8, raw: []const u8 };
+    for ([_]Kept{
+        .{ .name = "TF_FLASHNEXT_GATHER_READ", .raw = "pread" },
+        .{ .name = "TF_FLASHNEXT_PREFILL_TAIL", .raw = "512" },
+        .{ .name = "TF_FLASHNEXT_GATHER_EARLY", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_PROMPT_HC2", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_DRAFT_AHEAD", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_PROMPT_SHARED_DIRECT", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_PROMPT_GEMM2", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_SAMPLE_CAND", .raw = "1" },
+        .{ .name = "TF_FLASHNEXT_HOST_DRAW_THREADS", .raw = "7" },
+        .{ .name = "TF_FLASHNEXT_HEAD_PIECE", .raw = "1536" },
+        .{ .name = "TF_FLASHNEXT_PRODUCT_STREAMS", .raw = "5" },
+        .{ .name = "TF_FLASHNEXT_PROMPT_EXPERT_TILE_ROWS", .raw = "256" },
+    }) |kept| {
+        try check(kept.name, kept.raw, true);
+        try t.expect((try e.parse(kept.name, kept.raw)) != null);
+    }
+    // the row is 0 when it is not set or blank, and pread decodes as present (index 0), as the reader takes it
+    try t.expect((try e.value(?u64, "TF_FLASHNEXT_GATHER_READ", "pread", null)) != null);
+    try t.expect((try e.value(?u64, "TF_FLASHNEXT_GATHER_READ", null, null)) == null);
+    for ([_][]const u8{ "2", "mmap", "PREAD", "1" }) |raw| try check("TF_FLASHNEXT_GATHER_READ", raw, false);
 }
 
 test "Flash Next strict env: unset and blank settings both read as the caller's default" {

@@ -2,7 +2,7 @@
 const std = @import("std");
 const c = @import("contract.zig");
 const rows = @import("rows.zig");
-const bf16 = @import("../bf16_round.zig");
+const bf16 = @import("bf16_round"); // port: v1.2.8 wires the rounding rules as a module, not a sibling file
 
 /// The hidden width this family's residual stream has.
 pub const hidden = 5120;

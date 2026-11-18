@@ -9,7 +9,7 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#include "glue_math.cuh"
+#include "common/glue_math.cuh"
 
 namespace fn_glp {
 

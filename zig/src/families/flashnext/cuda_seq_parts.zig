@@ -53,16 +53,19 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
         .fed = 0,
         .logits = &.{},
         .cap = cap,
+        .kv = e.kv,
     };
     errdefer seq.deinit(e.gpa);
+    // --kv-cache fp8 rows hold the whole layer's KV heads (one rank)
+    if (e.kv == .fp8 and !e.heads.eql(.full)) return error.KvCacheFp8Unsupported;
     seq.logits = try e.gpa.alloc(u8, vocab * 2);
     try e.stream.d.check(e.stream.d.api.cuMemsetD8Async(block.ptr, 0, seqPartsBytes(e.heads), e.stream.handle), "cuMemsetD8Async");
     var at = block.ptr;
     seq.conv = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.convBytes(e.heads));
     seq.state = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.stateBytes(e.heads));
     seq.tail = viewAt(e.driver, &at, ple_tail_n * wide * 2);
-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads));
+    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads));
     seq.ikc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
     seq.pooled = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.pooledBytes(cap));
     return seq;

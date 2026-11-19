@@ -8,6 +8,10 @@ const media = @import("cuda_media.zig");
 pub const Limits = shared.media.Limits;
 pub const Vision = struct {
     pub const template_wraps = true;
+    /// the core Qwen-VL video prep (frame sampling and pairing), shared with the Metal host
+    pub const video = core.qwen_vl.video;
+    /// Qwen's video groups put the timestamp before the group's rows
+    pub const video_time_first = true;
     a: std.mem.Allocator,
     io: std.Io,
     tower: ?*shared.Tower,
@@ -17,11 +21,14 @@ pub const Vision = struct {
     limits: Limits,
     marks: struct { open: u32, image: u32, close: u32 },
     mark_ids: [3]u32,
+    video_ids: ?[3]u32, // vision_start, video_pad, vision_end: null when the checkpoint reads no video
     prep: cuda.Function,
     pool: cuda.Function,
     /// prep and pool through a stream's page table (TF_FLASHNEXT_KV_PAGES).
     prep_paged: cuda.Function,
     pool_paged: cuda.Function,
+    /// fn_attn_prep_media into fp8 caches (--kv-cache fp8); null: bf16 caches.
+    prep8: ?cuda.Function = null,
     pub fn load(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, limits: Limits, rank: usize, prep: cuda.Function, pool: cuda.Function, prep_paged: cuda.Function, pool_paged: cuda.Function) !*Vision {
         try shared.media.checkLimits(limits);
         const settings = (try shared.Settings.read(a, io, dir)) orelse return error.NoVisionTower;
@@ -45,7 +52,7 @@ pub const Vision = struct {
         var module: ?cuda.Module = if (t == null) try cuda.Module.load(d, cuda.kernels.qwen_vision) else null;
         errdefer if (module) |*m| m.unload();
         const splice = try (if (t) |x| &x.mod else &module.?).function("tf_qv_splice");
-        self.* = .{ .a = a, .io = io, .tower = t, .processor = settings.processor, .module = module, .limits = limits, .marks = .{ .open = c.vision_start, .image = c.image_token, .close = c.vision_end }, .mark_ids = .{ c.vision_start, c.image_token, c.vision_end }, .prep = prep, .pool = pool, .prep_paged = prep_paged, .pool_paged = pool_paged, .encoder = .{ .ctx = self, .config = c, .driver = d, .stream = s, .splice = splice, .encode = encode } };
+        self.* = .{ .a = a, .io = io, .tower = t, .processor = settings.processor, .module = module, .limits = limits, .marks = .{ .open = c.vision_start, .image = c.image_token, .close = c.vision_end }, .mark_ids = .{ c.vision_start, c.image_token, c.vision_end }, .video_ids = if (c.video_token) |vt| [3]u32{ c.vision_start, vt, c.vision_end } else null, .prep = prep, .pool = pool, .prep_paged = prep_paged, .pool_paged = pool_paged, .encoder = .{ .ctx = self, .config = c, .driver = d, .stream = s, .splice = splice, .encode = encode } };
         return self;
     }
     fn encode(ptr: *anyopaque, pixels: []const f32, grids: []const shared.Grid, out: u64) anyerror!void {
@@ -69,18 +76,24 @@ pub const Vision = struct {
         const p = try settings.prepare(v.io, a, bytes, max_tokens);
         return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
     }
+    /// Info.vision's video prepare: the decoded frames to the tower's pairs, on the HTTP thread.
+    pub fn prepareVideo(v: *Vision, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) anyerror!video.Prepared {
+        return video.prepare(a, s, v.processor, max_tokens, max_frames);
+    }
     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image) !media.State {
-        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged };
+        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
     }
     pub fn receive(v: *Vision, n: usize, runs: []const shared.media.Run) !media.State {
         const p = try shared.media.Plan.init(v.a, n, runs, v.limits);
-        return .{ .image = try shared.media.Media.allocate(p, v.encoder), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged };
+        return .{ .image = try shared.media.Media.allocate(p, v.encoder), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
     }
     pub fn explain(err: anyerror) ?[]const u8 {
         return switch (err) {
             error.BadImageLimits, error.BadImageCount => "image count or row budget exceeds the configured limits",
             error.BadImageGrid, error.BadImagePatches, error.BadImagePlaceholders => "image rows do not match the prompt placeholders",
             error.NoVisionTower, error.BadVisionWidth, error.UnsupportedQwenVision => "unsupported Flash Next Qwen-VL tower configuration",
+            error.VideoTooShort, error.VideoTooLarge, error.BadVideo => "the video could not be sampled into the tower's grid: too short, too large or unreadable",
+            error.VideoLibraryUnavailable => "video input needs libtfvideo.so (FFmpeg 9.0.2) reachable on the loader path",
             else => core.qwen_vl.geometry.problem(err),
         };
     }

@@ -10,6 +10,13 @@ const Allocator = std.mem.Allocator;
 
 const words = 32; // the n-gram history, the position, whether the MTP head's rows follow
 
+/// An engine's --kv-cache format (bf16 where it keeps none, as the host fakes).
+fn kvOf(e: anytype) @import("cuda_kv.zig").Kv {
+    const T = @TypeOf(e);
+    const S = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
+    return if (@hasField(S, "kv")) e.kv else .bf16;
+}
+
 /// The image's parts at `at`: words, then the state's own.
 pub fn partsOf(at: u32, head: bool, out: *std.ArrayList(rows.image.Part), a: Allocator) !void {
     try out.append(a, .{ .bytes = words });
@@ -81,6 +88,8 @@ pub fn View(comptime F: type) type {
 
         /// A device buffer for `at` tokens with the head's rows if this server drafts, filled by `scatter`.
         pub fn blank(c: *Target, at: u32) !*State {
+            // the disk image is bf16 rows (snap.shape): --kv-cache fp8 states stay in memory only
+            if (kvOf(c.engine) != .bf16) return error.KvFormat;
             const head = c.head != null;
             const st = try c.gpa.create(snap.Snap);
             errdefer c.gpa.destroy(st);
@@ -90,7 +99,7 @@ pub fn View(comptime F: type) type {
 
         /// A state from a stream that did not draft lacks the head's rows this server's parts name: it stays off disk.
         pub fn whole(c: *const Target, st: *const State) bool {
-            return st.head == (c.head != null) and st.rank_id == 0 and st.heads.eql(.full);
+            return st.head == (c.head != null) and st.rank_id == 0 and st.heads.eql(.full) and st.kv == .bf16;
         }
 
         /// What else the states depend on: whether the MTP head's rows are part of them.
@@ -116,6 +125,7 @@ pub fn policyOf(c: anytype) [13]u64 {
     grids.update(std.mem.asBytes(&k.fp8.resident));
     if (k.expert_tile) |x| grids.update(std.mem.asBytes(&x.resident));
     grids.update(std.mem.asBytes(&k.native_lane.prompt_sms)); // a BF16 prompt tile runs over half these SMs' worth
+    grids.update(std.mem.asBytes(&f.mx_min_n)); // TF_FLASHNEXT_PROMPT_MX128: the MXFP8 projections on the relaxed prompt tile
     return .{
         // TF_FLASHNEXT_CHUNK_SOLO and _CHUNK as resolved: a pass's rows alone, and beside a decoding stream
         e.chunk,

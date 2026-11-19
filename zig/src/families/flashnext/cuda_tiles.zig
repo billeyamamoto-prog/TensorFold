@@ -33,14 +33,15 @@ fn sweepOf(m: usize, bm: usize, k: usize) usize {
 }
 
 /// x [m, k] times w: the native lane, the 16-row lane tile, or from 64 rows the prompt tile (folded with K slices).
-pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize) !usize {
+/// `prompt`: a prompt pass's rows, which may take the relaxed MXFP8 tile (Kernels.nativeMatmulFor).
+pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize, prompt: bool) !usize {
     if (w.native) |native| {
         if (sk == 1) {
-            try k.nativeMatmul(stream, x, w.k, m, native, out, native_part, .bf16);
+            try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, out, native_part, .bf16);
             return 1;
         }
         // the native lane has reduced its own slices: that slice and one zero slice give the old sums' bits (-0 to +0)
-        try k.nativeMatmul(stream, x, w.k, m, native, part, native_part, .f32);
+        try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, part, native_part, .f32);
         const bytes = m * w.n * 4;
         try stream.d.check(stream.d.api.cuMemsetD8Async(part + bytes, 0, bytes, stream.handle), "cuMemsetD8Async");
         return 2;

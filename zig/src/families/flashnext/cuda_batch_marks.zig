@@ -20,7 +20,7 @@ pub fn inPass(p: anytype) bool {
 /// Each mark's n-gram tail: the window before the pass moved on by the mark's rows.
 pub fn tails(p: anytype) !void {
     for (p.hooks.marks) |m| if (cutOf(p, m)) |cut| {
-        const dst = m.base + snap_at.tail(m.at);
+        const dst = m.base + snap_at.tail(m.at, p.seq.kv);
         try p.copy(dst, p.seq.tail.ptr, snap_at.tail_size);
         try p.shiftWindow(dst, p.s.ple_nrow, wt.wide, cut, wt.ple_tail_n, wt.wide);
     };

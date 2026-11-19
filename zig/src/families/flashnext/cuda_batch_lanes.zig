@@ -72,7 +72,8 @@ pub fn useAttn(pass: anytype, n: usize) bool {
     // its launches take the whole layer's heads; a rank's half under the head split goes lane by lane
     if (!pass.m.layers[0].heads.eql(.full)) return false;
     for (pass.lanes) |l| {
-        if (l.seq.media != null or l.seq.pg.pt != 0 or l.rows == 0 or l.rows > glue.ahead_rows) return false;
+        // fp8 caches (--kv-cache fp8) go lane by lane: the one-launch kernels read bf16 rows
+        if (l.seq.media != null or l.seq.pg.pt != 0 or l.seq.kv != .bf16 or l.rows == 0 or l.rows > glue.ahead_rows) return false;
         if (l.seq.kc.len > wt.layers_n / 4 or l.seq.scores != pass.lanes[0].seq.scores or l.pos + l.rows > l.seq.cap) return false;
     }
     return true;

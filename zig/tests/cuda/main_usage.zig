@@ -31,6 +31,7 @@ pub const usage =
     \\  flashnext-gdn-heads [BASELINE]  DeltaNet full/half bytes, optionally against a frozen flashnext_batch.fatbin
     \\  flashnext-tp-heads MODEL  each rank's cut in-projections and attention heads equal the whole layer's bytes
     \\  flashnext-pages           the attention glue's caches through a page table: paged == contiguous, float64, controls
+    \\  flashnext-kv8             Flash Next's --kv-cache fp8 write against its format model and its reads against the bf16 kernels (synthetic)
     \\  info                      driver, device and library versions
     \\  smoke                     copies, fills, launches, argument packing, module globals
     \\  shared-context            Context.shared and Stream.borrowed as a library inside a host's process sees them
@@ -137,6 +138,7 @@ pub const usage =
     \\  qmmf-prompt-contract     K64 and K32 replacement gates with both new output controls
     \\  qmmf-prompt-repro        isolate M=65 N=8240 K=2560 SK=4 BF16 without clusters
     \\  qmmf-prompt-bench        rank0 normal-main weighted A-B-A timings, plus separate MTP hidden timings
+    \\  qmmf-prompt-mx           relaxed MXFP8 prompt tile: FP64 bound, row bytes independent of the call's rows, timed against the lane
     \\  qmm-prefill-many-bench    same-process A-B-A screening for the GB10 launch fusion
     \\  prompt-swiglu-contract    the lean gate/up SwiGLU pair against two products and the act kernel, controls red
     \\  prompt-swiglu-bench       same-process A-B-A: the lean SwiGLU pair against two products and the act kernel

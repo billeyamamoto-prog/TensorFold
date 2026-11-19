@@ -92,6 +92,15 @@ its path.
   layer reads 512 blocks of 4 keys a row, chosen by the model's block indexer, as the Python engine does.
 - `--parallel N` admits N streams. Each stream's caches are its own: about 110 MiB of DeltaNet state and the n-gram
   tail, plus 28 KiB a token of keys, values and indexer keys, and with drafts its MTP head's cache.
+- `--kv-cache fp8` (one rank, the engine's own glue, contiguous caches; not with `--tp`, `--slide` or
+  `TF_FLASHNEXT_KV_PAGES`) keeps keys and values as e4m3 codes with a power-of-two scale a position and KV head: 1,056
+  bytes a position and layer instead of 2,048, so a token's caches take about 17.5 KiB instead of 30 KiB. The indexer's
+  keys, the pooled blocks and the DeltaNet states stay bf16. Attention reads the codes widened to bf16 exactly, so it is
+  the bf16 kernels' arithmetic on rows rounded to e4m3: lossy against a bf16 cache, deterministic for a given prompt.
+  The MTP head's own cache stays bf16 while a stream still fits the bytes it is charged (all but a stream within a
+  twentieth of the full window; `TF_FLASHNEXT_HEAD_KV=fp8` keeps it fp8). Shared rounds attend lane by lane
+  (`TF_FLASHNEXT_ATTN_LANES` does not apply), and kept states stay in memory (the disk tier takes bf16 states only).
+  bf16 stays the default.
 - `--no-drafts` serves without the MTP head; `"draft": false` on a request does the same for that request.
 - `TF_FLASHNEXT_READOUT_ROWS` (default 64, `0` never) is the rows from which the hyper-connection read-out takes the prompt
   tiles. Same bits either way; `128` keeps 16-stream decode rounds on the row kernels, up to 7% quicker on a GB10.

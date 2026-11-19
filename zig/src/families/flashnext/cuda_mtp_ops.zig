@@ -14,6 +14,7 @@ const pieces = @import("cuda_mtp_pieces.zig");
 const draw = @import("cuda_mtp_draw.zig");
 const module = @This();
 const ple = @import("cuda_ple.zig");
+const scratch_sizes = @import("cuda_scratch_sizes.zig");
 
 /// One group of lanes in the batched head's pass: the lanes' drafts, their rows and whether the head scores.
 const Group = struct {
@@ -141,7 +142,10 @@ pub fn Ops(comptime Tri: type) type {
             if (d.len + next.len > d.cap) return error.PromptTooLong;
             const want = plan.reserveRows(next.len);
             const s = try e.reserve(want);
-            const piece = @max(@as(usize, 1), @min(piece_max, s.cap / 2));
+            // the head's fc lanes run `streams` rows a token and the decode-shaped matmul zeroes their second
+            // slice into part: a piece past the scratch's partRows / (2 * streams) rows fills one past part
+            // (v1.1.4 held eight slices and clamped the piece to 256, so only the 1.2.8 scratch shape trips it)
+            const piece = @max(@as(usize, 1), @min(piece_max, scratch_sizes.headPieceRows(s.cap)));
             // the engine's block scores (the passes share one stream), for rows past 2,048 keys of the head's cache
             const score_rows = try e.reserveScores(d.cap, piece);
             var p: batch.Pass(Tri) = .{

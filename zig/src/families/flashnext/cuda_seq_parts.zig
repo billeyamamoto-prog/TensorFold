@@ -53,6 +53,9 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
         .fed = 0,
         .logits = &.{},
         .cap = cap,
+        // the engine's cache format: the lane's draft takes it too (cuda_lanes.zig initPartsFor), and a sequence
+        // labeled another one makes snap.finish price its head rows twice (the move's off == bytesWith assert)
+        .kv = e.kv,
     };
     errdefer seq.deinit(e.gpa);
     seq.logits = try e.gpa.alloc(u8, vocab * 2);
@@ -61,8 +64,9 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
     seq.conv = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.convBytes(e.heads));
     seq.state = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.stateBytes(e.heads));
     seq.tail = viewAt(e.driver, &at, ple_tail_n * wide * 2);
-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+    // fp8 sizes the contiguous rows only (as newSeqOn does): the lane's own caches hold its format's rows
+    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads));
+    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads));
     seq.ikc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
     seq.pooled = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.pooledBytes(cap));
     return seq;

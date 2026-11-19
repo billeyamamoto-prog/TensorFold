@@ -169,7 +169,19 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
             off += p.n;
         }
     }
-    std.debug.assert(off == bytesWith(seq.kv, if (d) |h| h.kv else null, at, seq.heads));
+    // the copies' bytes must price out to the state's shape; a mismatch is a bug upstream of this copy (a format
+    // the pieces and the pricing disagree on, a shape a buffer lies about), so say what moved instead of panicking
+    const priced = bytesWith(seq.kv, if (d) |h| h.kv else null, at, seq.heads);
+    if (off != priced) {
+        std.log.err("flashnext snap: moved {d} bytes where the state prices {d} (at {d}, seq kv {s}, head kv {s}, heads nk {d} nv {d} q {d} kv {d}, way {s})", .{
+            off,                                             priced,
+            at,                                              @tagName(seq.kv),
+            if (d) |h| @tagName(h.kv) else "none",           seq.heads.nk,
+            seq.heads.nv,                                    seq.heads.q,
+            seq.heads.kv,                                    @tagName(way),
+        });
+        return error.SnapShape;
+    }
 }
 
 /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.

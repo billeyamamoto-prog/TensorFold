@@ -9,6 +9,7 @@ pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
 const chunks = @import("cuda_chunk.zig");
+pub const kv_format = @import("cuda_kv.zig");
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -93,6 +94,7 @@ pub const max_tokens: usize = weights.window;
 /// A stream's device bytes at a rank's heads (cuda_seq_bytes.zig).
 const sizes = @import("cuda_seq_bytes.zig");
 pub const seqBytes = sizes.seqBytes;
+pub const seqBytesFor = sizes.seqBytesFor;
 pub const seqBytesPaged = sizes.seqBytesPaged;
 pub const pooledBytes = sizes.pooledBytes;
 const Heads = @import("cuda_heads.zig").Heads;
@@ -133,6 +135,9 @@ pub const Engine = struct {
     pockets: pocket.Pockets = .{},
     /// During a round of taught and untaught streams: its rows' pocket scales (0 on an untaught row); 0: none.
     taught_rows: u64 = 0,
+    /// The attention caches' format of every sequence this engine makes (--kv-cache); set before the first newSeq.
+    kv: kv_format.Kv = .bf16,
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         return initRank(gpa, io, driver, stream, model_dir, 1, 0);
     }
@@ -153,6 +158,7 @@ pub const Engine = struct {
         e.image_factory = null;
         e.round_graph = .{};
         e.graphs = .{};
+        e.kv = .bf16;
         errdefer for (e.layers[0..e.n_layers]) |*l| l.free(gpa);
         e.model_dir = try gpa.dupe(u8, model_dir);
         errdefer gpa.free(e.model_dir);
@@ -307,6 +313,7 @@ pub const Engine = struct {
             .fed = 0,
             .logits = &.{},
             .cap = cap,
+            .kv = e.kv,
         };
         paged = null; // seq owns the pages from here
         // One rollback owns every published array, and drains before releasing any destination.
@@ -314,8 +321,10 @@ pub const Engine = struct {
         seq.logits = try e.gpa.alloc(u8, vocab * 2);
         seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.convBytes(e.heads));
         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
-        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
-        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+        // --kv-cache fp8 rows are contiguous and whole-layer (one rank): cuda_lanes_load.zig refuses pages and --tp with it
+        if (e.kv == .fp8 and (seq.paged != null or !e.heads.eql(.full))) return error.KvCacheFp8Unsupported;
+        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads));
+        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads));
         seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
         seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
@@ -492,10 +501,12 @@ pub const Seq = struct {
     cap: usize,
     /// The model as shipped: no learned neuron acts on its rows (a lesson writer's and its judge's reads).
     untaught: bool = false,
+    /// The format of kc and vc (the engine's --kv-cache).
+    kv: kv_format.Kv = .bf16,
 
     /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
     pub fn view(s: *Seq, scores: u64) batch.SeqState {
-        return .{ .gen = s.gen, .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .pg = s.pg() };
+        return .{ .gen = s.gen, .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .pg = s.pg(), .kv = s.kv };
     }
 
     /// The attention kernels' page argument (zero: contiguous caches).
@@ -579,4 +590,5 @@ test {
     _ = @import("cuda_sequence_completion_test.zig");
     _ = chunks;
     _ = sizes;
+    _ = kv_format;
 }

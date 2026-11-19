@@ -43,7 +43,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
         return out;
     }
     if (comptime @hasDecl(T, "prepareVideo")) if (x.video_ids) |*vm| {
-        out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames };
+        out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames, .time_first = if (comptime @hasDecl(T, "video_time_first")) vm[1] else null };
     };
     return out;
 }

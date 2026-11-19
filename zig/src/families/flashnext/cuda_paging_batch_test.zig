@@ -66,6 +66,16 @@ const Fake = struct {
         try std.testing.expectEqual(C.expected_pg, pg);
         C.fused += 1;
     }
+    // --kv-cache fp8 (contiguous only): a paged pass never reaches these
+    pub fn attnPrepKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {
+        return error.KvCachePaged;
+    }
+    pub fn attnChunksKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {
+        return error.KvCachePaged;
+    }
+    pub fn attnFusedKv8(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {
+        return error.KvCachePaged;
+    }
     pub fn hcNormalize(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}
     pub fn hcDenseMix(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}
     pub fn hcDown(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}

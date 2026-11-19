@@ -176,6 +176,9 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
         try changed.append(t.allocator, try flashKey(&x, &c));
         @field(k.forms, field) = 64;
     }
+    k.forms.mx_min_n = 0; // TF_FLASHNEXT_PROMPT_MX128=0: the MXFP8 projections on the exact kernels
+    try changed.append(t.allocator, try flashKey(&x, &c));
+    k.forms.mx_min_n = 1024;
     k.expert_tile = .{ .mod = undefined, .fns = undefined, .resident = .{ 64, 64 }, .selection = .up };
     const up = try flashKey(&x, &c);
     k.expert_tile.?.selection = .both; // the same grids: the selection alone moves the key
@@ -216,7 +219,7 @@ test "disk identity: Flash Next CUDA prompt forms take each setting's value at l
     const env = @import("sys").env;
     const Engine = @typeInfo(@FieldType(flash.Cuda, "engine")).pointer.child;
     const Forms = @FieldType(@FieldType(Engine, "batch_k"), "forms");
-    const names = [_][:0]const u8{ "TF_FLASHNEXT_GDN_FUSED", "TF_FLASHNEXT_HC_FUSE", "TF_FLASHNEXT_KEEP_INPASS", "TF_FLASHNEXT_READOUT_ROWS", "TF_FLASHNEXT_FACT_ROWS" };
+    const names = [_][:0]const u8{ "TF_FLASHNEXT_GDN_FUSED", "TF_FLASHNEXT_HC_FUSE", "TF_FLASHNEXT_KEEP_INPASS", "TF_FLASHNEXT_READOUT_ROWS", "TF_FLASHNEXT_FACT_ROWS", "TF_FLASHNEXT_PROMPT_MX128" };
     for (names) |n| _ = env.unsetenv(n);
     defer for (names) |n| {
         _ = env.unsetenv(n);
@@ -224,7 +227,7 @@ test "disk identity: Flash Next CUDA prompt forms take each setting's value at l
     try t.expectEqualDeep(Forms{}, Forms.resolve());
     for (names) |n| _ = env.setenv(n, "0", 1);
     const never = std.math.maxInt(usize);
-    try t.expectEqualDeep(Forms{ .gdn_fused = false, .hc_fuse = false, .in_pass = false, .readout_rows = never, .fact_rows = never }, Forms.resolve());
+    try t.expectEqualDeep(Forms{ .gdn_fused = false, .hc_fuse = false, .in_pass = false, .readout_rows = never, .fact_rows = never, .mx_min_n = 0 }, Forms.resolve());
     _ = env.setenv("TF_FLASHNEXT_READOUT_ROWS", "128", 1);
     _ = env.setenv("TF_FLASHNEXT_FACT_ROWS", "32", 1);
     try t.expectEqual(@as(usize, 128), Forms.resolve().readout_rows);

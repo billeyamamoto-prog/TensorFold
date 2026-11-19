@@ -333,6 +333,7 @@ pub fn headBytes(fp8: bool) usize {
 pub const Pick = @import("cuda_mtp_draft.zig").Pick;
 pub const Chain = @import("cuda_mtp_draft.zig").Chain;
 pub const Draft = @import("cuda_mtp_draft.zig").Draft;
+pub const headFormat = @import("cuda_mtp_draft.zig").headFormat;
 pub const Ops = @import("cuda_mtp_ops.zig").Ops;
 pub const check = @import("cuda_mtp_check.zig").check;
 

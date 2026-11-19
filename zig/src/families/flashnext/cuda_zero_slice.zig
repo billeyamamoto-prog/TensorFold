@@ -11,12 +11,12 @@ pub fn spends(native: bool, sk: usize, m: usize, n: usize, cap: usize) bool {
 }
 
 /// Pass.lane into s.part: spends the zero slice as it must; `zero` and native: one slice, no clears (1), else null.
-pub fn lane(k: *const parts.Kernels, stream: cuda.Stream, s: *parts.Scratch, zero: bool, x: u64, w: wt.Q4, part: u64, m: usize, sk: usize) !?usize {
+pub fn lane(k: *const parts.Kernels, stream: cuda.Stream, s: *parts.Scratch, zero: bool, x: u64, w: wt.Q4, part: u64, m: usize, sk: usize, prompt: bool) !?usize {
     if (part != s.part) return null;
     if (spends(w.native != null, sk, m, w.n, s.cap)) s.part_zero = false;
     const native = w.native orelse return null;
     if (!zero or sk == 1) return null;
-    try k.nativeMatmul(stream, x, w.k, m, native, part, s.native_part, .f32);
+    try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, part, s.native_part, .f32);
     return 1;
 }
 

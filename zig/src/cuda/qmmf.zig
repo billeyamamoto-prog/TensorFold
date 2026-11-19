@@ -157,6 +157,12 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
 pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
 pub const prompt_rows: usize = 512;
 pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;
+/// The relaxed MXFP8 prompt tile's dynamic shared bytes: 2 stages of 128 input rows (16 KiB), 128 weight columns (8 KiB)
+/// and their scales; two blocks fit an SM.
+pub const prompt_mx_shared: u32 = 2 * ((128 * 128 + 128 * group + 128 * 2 + 127) / 128 * 128);
+/// Its short-call form (64 x 64 blocks, four stages; the same bits): calls of prompt_mx_small_rows rows or fewer.
+pub const prompt_mx64_shared: u32 = 4 * ((64 * 128 + 64 * group + 64 * 2 + 127) / 128 * 128);
+pub const prompt_mx_small_rows: usize = 128;
 
 pub fn promptK32Symbol(comptime out: Out) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN7tf_qmmf22qmmf_prompt_k32_kernelILb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(out == .f32)});
@@ -188,6 +194,9 @@ pub const Lane = struct {
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
+    prompt_mx: ?[2][2]Function = null, // Out, then 128 x 128 / 64 x 64: the relaxed MXFP8 prompt tile, loadPromptMx() fills it
+    // the narrowest MXFP8 projection that tile takes: by the weight's width alone, so a row's bits never depend on its chunk
+    prompt_mx_min: usize = 0,
     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
 
     pub fn load(d: *const Driver, capability_major: u32) !Lane {
@@ -244,6 +253,20 @@ pub const Lane = struct {
         l.prompt_sms = @intCast(@max(sms, 1));
     }
 
+    /// The relaxed MXFP8 prompt tile (qmmf.cu prompt_mx_body) for MXFP8 weights `min_n` columns wide or more; 0: not loaded.
+    /// Only families whose prompt passes may leave the exact kernels' bits call this.
+    pub fn loadPromptMx(l: *Lane, min_n: usize) !void {
+        if (min_n == 0) return;
+        var mx: [2][2]Function = undefined;
+        const names = [2][2][:0]const u8{ .{ "tf_qmmf_prompt_mx_bf16", "tf_qmmf_prompt_mx64_bf16" }, .{ "tf_qmmf_prompt_mx_f32", "tf_qmmf_prompt_mx64_f32" } };
+        for (&mx, names) |*pair, pn| for (pair, pn, [2]u32{ prompt_mx_shared, prompt_mx64_shared }) |*f, name, bytes| {
+            f.* = try l.mod.function(name);
+            try f.allowDynamicShared(bytes);
+        };
+        l.prompt_mx = mx;
+        l.prompt_mx_min = min_n;
+    }
+
     pub fn unload(l: *Lane) void {
         l.mod.unload();
     }
@@ -271,6 +294,43 @@ pub const Lane = struct {
         const p = planFor(m, w, l.clusters);
         return promptEligible(m, w) and !p.cluster and !p.reduce and l.prompt != null and
             2 * promptBlocks(m, w.n) > l.prompt_sms;
+    }
+
+    /// Whether a prompt pass's call takes the relaxed MXFP8 tile: loaded, and an MXFP8 weight `prompt_mx_min` wide or more.
+    pub fn takesPromptMx(l: Lane, w: Weight) bool {
+        return l.prompt_mx != null and l.prompt_mx_min != 0 and w.mode == .mxfp8 and w.n >= l.prompt_mx_min;
+    }
+
+    /// y [m, n] = x times an MXFP8 weight on the 128 x 128 prompt tile whose block scales ride in the B fragment: one fp32
+    /// chain over K, no K slices, written as `out` says. Not the exact kernels' bits (takesPromptMx gates it).
+    pub fn matmulPromptMx(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out) !void {
+        return l.matmulPromptMxTile(s, x, ldx, m, w, y, out, m <= prompt_mx_small_rows);
+    }
+
+    /// matmulPromptMx on the 128 x 128 tile or (`small`) its 64 x 64 form: the same bits either way.
+    pub fn matmulPromptMxTile(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, small: bool) !void {
+        const fns = l.prompt_mx orelse return error.PromptTileUnavailable;
+        if (w.mode != .mxfp8) return error.PromptTileUnavailable;
+        const tile: usize = if (small) 64 else 128;
+        const rows_t = (m + tile - 1) / tile;
+        const band = @max(1, @min(rows_t, (12 << 20) / (tile * w.k * 2)));
+        var args: launch_.Args = .{};
+        args.add(x);
+        args.add(w.codes);
+        args.add(w.scales);
+        args.add(w.scale);
+        args.add(y);
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(w.n)));
+        args.add(@as(i32, @intCast(w.k)));
+        args.add(@as(i32, @intCast(w.npad)));
+        args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
+        args.add(@as(i32, @intCast(band)));
+        try launch_.launch(fns[@backingInt(out)][@intFromBool(small)], .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + tile - 1) / tile)), .y = 1, .z = 1 },
+            .block = .{ .x = if (small) 128 else 256, .y = 1, .z = 1 },
+            .shared = if (small) prompt_mx64_shared else prompt_mx_shared,
+        }, s, &args);
     }
 
     /// matmul() writing y as `out` says: bf16, or fp32.
@@ -384,6 +444,12 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
     try std.testing.expect(!q.fused and q.cluster and q.bm == 16 and q.sk == 8);
     const r = plan(3, 2560, 6144, false);
     try std.testing.expect(r.reduce and !r.cluster);
+}
+
+test "the relaxed MXFP8 prompt tile's two stages fit two blocks in an SM" {
+    try std.testing.expectEqual(@as(u32, 49664), prompt_mx_shared);
+    try std.testing.expect(2 * prompt_mx_shared <= 100 * 1024);
+    try std.testing.expectEqual(@as(u32, 49664), prompt_mx64_shared);
 }
 
 test "instance names are qmmf.cu's" {

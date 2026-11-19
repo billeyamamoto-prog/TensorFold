@@ -530,6 +530,8 @@ pub const SeqState = struct {
     scores: u64,
     /// The attention caches' pages (pt 0: kc, vc, ikc and pooled are contiguous rows).
     pg: @import("cuda_glue.zig").Pg = .{},
+    /// The format of kc and vc (cuda_kv.zig): bf16 rows, or --kv-cache fp8's codes and scales.
+    kv: @import("cuda_kv.zig").Kv = .bf16,
 };
 
 pub const scoreStride = sizes.scoreStride;

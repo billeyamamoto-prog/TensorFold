@@ -8,6 +8,7 @@ const Draft = @import("cuda_mtp_draft.zig").Draft;
 const pages = @import("cuda_pages.zig");
 const sizes = @import("cuda_seq_bytes.zig");
 const Heads = @import("cuda_heads.zig").Heads;
+const Kv = @import("cuda_kv.zig").Kv;
 
 const index_row = wt.index_dim * 2;
 const tail_bytes = wt.ple_tail_n * wt.wide * 2;
@@ -17,15 +18,29 @@ const head_heads: Heads = .full;
 /// A state's shape for its disk image (cuda_disk.zig, one rank, the whole layer): layer counts and bytes a row.
 pub const shape = .{ .linear = wt.linear_n, .attn = wt.attn_n, .conv = sizes.convBytes(.full), .state = sizes.stateBytes(.full), .kv_row = Heads.full.kvRow(), .index_row = index_row, .ratio = wt.index_ratio, .tail = tail_bytes };
 
+/// A key row and a value row of one position at heads `h` in format `kv` (--kv-cache fp8: whole heads, cuda_kv.zig).
+fn keyRow(h: Heads, kv: Kv) usize {
+    return if (kv == .fp8) kv.keyRow() else h.kvRow();
+}
+fn valueRow(h: Heads, kv: Kv) usize {
+    return if (kv == .fp8) kv.valueRow() else h.kvRow();
+}
+
 /// One attention cache's first `at` key, value and indexer-key rows at heads `h`, and the pooled blocks they complete.
-fn attnBytes(at: usize, h: Heads) usize {
-    return at * (2 * h.kvRow() + index_row) + at / wt.index_ratio * index_row;
+fn attnBytes(at: usize, h: Heads, kv: Kv) usize {
+    return at * (keyRow(h, kv) + valueRow(h, kv) + index_row) + at / wt.index_ratio * index_row;
 }
 
 /// Device bytes a state at the model's heads `h` after `at` tokens takes: fixed DeltaNet pieces, attention by token.
 pub fn bytes(at: usize, head: bool, h: Heads) usize {
-    const own = wt.linear_n * (sizes.convBytes(h) + sizes.stateBytes(h)) + wt.attn_n * attnBytes(at, h) + tail_bytes;
-    return own + if (head) attnBytes(at, head_heads) else 0;
+    return bytesKv(at, h, .bf16, if (head) .bf16 else null);
+}
+
+/// bytes with the attention caches in format `kv` and the head's (when `head_kv` is not null) in its own: an fp8 state
+/// takes 1,056 bytes of keys and values a layer and token where a bf16 one takes 2,048.
+pub fn bytesKv(at: usize, h: Heads, kv: Kv, head_kv: ?Kv) usize {
+    const own = wt.linear_n * (sizes.convBytes(h) + sizes.stateBytes(h)) + wt.attn_n * attnBytes(at, h, kv) + tail_bytes;
+    return own + if (head_kv) |hk| attnBytes(at, head_heads, hk) else 0;
 }
 
 /// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
@@ -37,6 +52,10 @@ pub const Snap = struct {
     head: bool,
     /// The model's heads its pieces hold (the saved sequence's): a sequence of other heads cannot take it.
     heads: Heads = .full,
+    /// The format of the attention rows it holds (the engine's --kv-cache).
+    kv: Kv = .bf16,
+    /// The format of the head's rows when it holds them (cuda_mtp_draft.zig headFormat).
+    head_kv: Kv = .bf16,
 };
 
 /// Where a kept state's pieces sit in its buffer (move's order) for a pass's marks (Hooks.marks): whole heads only.
@@ -54,9 +73,9 @@ pub const layout = struct {
     pub fn state(li: usize) u64 {
         return wt.linear_n * conv_bytes + li * state_bytes;
     }
-    /// The n-gram tail of a state after `n` tokens (after every attention cache's rows).
-    pub fn tail(n: usize) u64 {
-        return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(n, .full);
+    /// The n-gram tail of a state after `n` tokens (after every attention cache's rows in format `kv`).
+    pub fn tail(n: usize, kv: Kv) u64 {
+        return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(n, .full, kv);
     }
 };
 
@@ -66,21 +85,31 @@ const Way = enum { save, restore, rows };
 pub const Piece = struct { layers: usize, n: usize, row: usize = 0, per: usize = 1 };
 
 /// `move`'s pieces in order at `at` and the model's heads `h` (the disk image's at full): DeltaNet, attention, tail.
-pub fn order(at: usize, head: bool, h: Heads) struct { p: [11]Piece, len: usize } {
+pub const Order = struct { p: [11]Piece, len: usize };
+
+pub fn order(at: usize, head: bool, h: Heads) Order {
+    return orderKv(at, h, .bf16, if (head) .bf16 else null);
+}
+
+/// order with the attention rows in format `kv` and the head's (when `head_kv` is not null) in its own.
+pub fn orderKv(at: usize, h: Heads, kv: Kv, head_kv: ?Kv) Order {
+    const head = head_kv != null;
     var o: [11]Piece = undefined;
     o[0] = .{ .layers = wt.linear_n, .n = sizes.convBytes(h) };
     o[1] = .{ .layers = wt.linear_n, .n = sizes.stateBytes(h) };
-    o[2..6].* = attnOrder(wt.attn_n, at, h);
+    o[2..6].* = attnOrder(wt.attn_n, at, h, kv);
     o[6] = .{ .layers = 1, .n = tail_bytes };
-    if (head) o[7..11].* = attnOrder(1, at, head_heads);
+    if (head_kv) |hk| o[7..11].* = attnOrder(1, at, head_heads, hk);
     return .{ .p = o, .len = if (head) 11 else 7 };
 }
 
 /// An attention cache's pieces for `at` rows: complete pooled blocks only (the rest pool again as later rows land).
-fn attnOrder(layers: usize, at: usize, h: Heads) [4]Piece {
+fn attnOrder(layers: usize, at: usize, h: Heads, kv: Kv) [4]Piece {
+    const kr = keyRow(h, kv);
+    const vr = valueRow(h, kv);
     return .{
-        .{ .layers = layers, .n = at * h.kvRow(), .row = h.kvRow() },
-        .{ .layers = layers, .n = at * h.kvRow(), .row = h.kvRow() },
+        .{ .layers = layers, .n = at * kr, .row = kr },
+        .{ .layers = layers, .n = at * vr, .row = vr },
         .{ .layers = layers, .n = at * index_row, .row = index_row },
         .{ .layers = layers, .n = at / wt.index_ratio * index_row, .row = index_row, .per = wt.index_ratio },
     };
@@ -90,7 +119,10 @@ fn attnOrder(layers: usize, at: usize, h: Heads) [4]Piece {
 fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize, way: Way) !void {
     const dr = stream.d;
     var off: u64 = 0;
-    const o = order(at, d != null, seq.heads);
+    // fp8 rows are contiguous only (cuda_prompt.zig newSeq refuses pages with them)
+    if (seq.kv == .fp8 and seq.paged != null) return error.KvCachePaged;
+    const head_kv: ?Kv = if (d) |h| h.kv else null;
+    const o = orderKv(at, seq.heads, seq.kv, head_kv);
     var bufs: [11][]cuda.DeviceBuffer = undefined;
     bufs[0..7].* = .{ seq.conv, seq.state, seq.kc, seq.vc, seq.ikc, seq.pooled, (&seq.tail)[0..1] };
     if (d) |h| bufs[7..11].* = .{ (&h.kc)[0..1], (&h.vc)[0..1], (&h.ikc)[0..1], (&h.pooled)[0..1] };
@@ -128,7 +160,7 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
             off += p.n;
         }
     }
-    std.debug.assert(off == bytes(at, d != null, seq.heads));
+    std.debug.assert(off == bytesKv(at, seq.heads, seq.kv, head_kv));
 }
 
 /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
@@ -137,7 +169,8 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Str
     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, d != null, seq.heads)), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads };
+    const head_kv: ?Kv = if (d) |h| h.kv else null;
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesKv(at, seq.heads, seq.kv, head_kv)), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads, .kv = seq.kv, .head_kv = head_kv orelse .bf16 };
     errdefer snap.buf.free();
     errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
     try move(stream, seq, d, snap.buf.ptr, at, .save);
@@ -146,17 +179,18 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Str
 }
 
 /// A kept state for position `at` that a pass running past it fills (Hooks.marks); `finish` adds the attention rows.
-pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, head: bool, heads: Heads) !*Snap {
+pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, heads: Heads, kv: Kv, head_kv: ?Kv) !*Snap {
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, head, heads)), .at = at, .history = history, .head = head, .heads = heads };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesKv(at, heads, kv, head_kv)), .at = at, .history = history, .head = head_kv != null, .heads = heads, .kv = kv, .head_kv = head_kv orelse .bf16 };
     return snap;
 }
 
 /// After the pass ran past `snap.at`: the attention caches' first rows (and the head's) into `snap`, queued.
 pub fn finish(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap) !void {
     if (seq.fed < snap.at) return error.NotAtMark;
-    if (d) |h| if (!snap.head or h.len < snap.at) return error.NotAtMark;
+    if (snap.kv != seq.kv) return error.KvFormat;
+    if (d) |h| if (!snap.head or h.len < snap.at or h.kv != snap.head_kv) return error.NotAtMark;
     try move(stream, seq, d, snap.buf.ptr, snap.at, .rows);
 }
 
@@ -164,7 +198,8 @@ pub fn finish(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap) !v
 pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const Snap) !void {
     if (snap.at > seq.cap) return error.SequenceTooShort;
     if (!snap.heads.eql(seq.heads)) return error.SnapShape;
-    if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
+    if (snap.kv != seq.kv) return error.KvFormat;
+    if (d) |h| if (!snap.head or snap.at > h.cap or h.kv != snap.head_kv) return error.NoHeadState;
     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
     try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
     try stream.synchronize();
@@ -221,4 +256,33 @@ test "a state of the whole layer restores into no sequence of half the heads, an
 
 test {
     _ = @import("cuda_paging_snap_test.zig");
+}
+
+test "an fp8 state takes 1,056 + 256 bytes a layer and token, its head's cache too, and its pieces add up" {
+    try std.testing.expectEqual(@as(usize, 12 * (1056 + 256)), bytesKv(1, .full, .fp8, null) - bytesKv(0, .full, .fp8, null));
+    try std.testing.expectEqual(@as(usize, 13 * (1056 + 256)), bytesKv(1, .full, .fp8, .fp8) - bytesKv(0, .full, .fp8, .fp8));
+    for ([_]usize{ 0, 1, 4, 4096 }) |at| try std.testing.expectEqual(bytes(at, true, .full), bytesKv(at, .full, .bf16, .bf16));
+    // a bf16 head under fp8 caches: 2,048 + 256 bytes a token for the head and 1,056 + 256 for each layer
+    for ([_]usize{ 0, 1, 4, 513, 262144 }) |at| try std.testing.expectEqual(at * (2048 - 1056), bytesKv(at, .full, .fp8, .bf16) - bytesKv(at, .full, .fp8, .fp8));
+    const o = orderKv(8, .full, .fp8, .fp8);
+    try std.testing.expectEqual(@as(usize, 2 * 272), o.p[2].row);
+    try std.testing.expectEqual(@as(usize, 2 * 256), o.p[3].row);
+    var sum: usize = 0;
+    for (o.p[0..o.len]) |p| sum += p.layers * p.n;
+    try std.testing.expectEqual(bytesKv(8, .full, .fp8, .fp8), sum);
+    const ob = orderKv(8, .full, .fp8, .bf16);
+    try std.testing.expectEqual(@as(usize, 2 * 512), ob.p[7].row);
+    // the in-pass marks' n-gram tail sits after the fp8 rows
+    try std.testing.expectEqual(@as(u64, bytesKv(8, .full, .fp8, null) - tail_bytes), layout.tail(8, .fp8));
+}
+
+test "a state of one cache format restores into no sequence of the other" {
+    var driver: cuda.Driver = undefined;
+    const stream: cuda.Stream = .{ .d = &driver, .handle = null };
+    for ([_][2]Kv{ .{ .bf16, .fp8 }, .{ .fp8, .bf16 } }) |pair| {
+        const kept: Snap = .{ .buf = .{ .d = &driver, .ptr = 0x100, .len = 1, .borrowed = true }, .at = 1, .history = .{ 0, 0 }, .head = false, .kv = pair[0] };
+        var seq: prompt.Seq = .{ .heads = .full, .kv = pair[1], .conv = &.{}, .state = &.{}, .kc = &.{}, .vc = &.{}, .ikc = &.{}, .pooled = &.{}, .tail = .{ .d = &driver, .ptr = 0, .len = 0 }, .history = .{ 0, 0 }, .fed = 0, .logits = &.{}, .cap = 8 };
+        try std.testing.expectError(error.KvFormat, restore(stream, &seq, null, &kept));
+        try std.testing.expectEqual(@as(usize, 0), seq.fed);
+    }
 }

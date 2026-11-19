@@ -41,6 +41,7 @@ pub const Forms = struct {
     in_pass: bool = true, // TF_FLASHNEXT_KEEP_INPASS
     readout_rows: usize = 64, // TF_FLASHNEXT_READOUT_ROWS (maxInt: never)
     fact_rows: usize = 64, // TF_FLASHNEXT_FACT_ROWS (maxInt: never)
+    mx_min_n: usize = 1024, // TF_FLASHNEXT_PROMPT_MX128 (0: the exact kernels in prompt passes too)
 
     pub fn resolve() Forms {
         return .{
@@ -49,6 +50,7 @@ pub const Forms = struct {
             .in_pass = @import("cuda_lanes_snap.zig").keepInPass(),
             .readout_rows = @import("cuda_chunk.zig").readoutTileRows(),
             .fact_rows = @import("cuda_nvfp4_tile.zig").factRows(),
+            .mx_min_n = @import("cuda_prompt_knobs.zig").mx128MinN(),
         };
     }
 };
@@ -116,6 +118,7 @@ pub const Kernels = struct {
         k.native_lane = try cuda.qmmf.Lane.load(d, (try d.currentCapability()) / 10); // the current device: its tiles
         errdefer k.native_lane.unload();
         if (envOn("TF_FLASHNEXT_PROMPT_BF16")) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
+        try k.native_lane.loadPromptMx(k.forms.mx_min_n); // prompt passes only (nativeMatmulFor)
         var device: c_int = 0;
         var sms: c_int = 0;
         try d.check(d.api.cuDeviceGet(&device, 0), "cuDeviceGet");
@@ -148,6 +151,13 @@ pub const Kernels = struct {
     /// A native projection over m rows on the lane (its 128-row tile for BF16 from qmmf.prompt_rows rows).
     pub fn nativeMatmul(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, m: usize, w: cuda.qmmf.Weight, y: u64, part: u64, out: cuda.qmmf.Out) !void {
         return k.native_lane.matmulOut(s, x, ldx, m, w, y, out, part);
+    }
+
+    /// nativeMatmul, but a prompt pass's (`prompt`) MXFP8 projections of forms.mx_min_n columns or more take the relaxed
+    /// 128 x 128 MXFP8 tile (one fp32 chain over K, no slices: `y` holds the whole sum).
+    pub fn nativeMatmulFor(k: *const Kernels, prompt: bool, s: cuda.Stream, x: u64, ldx: usize, m: usize, w: cuda.qmmf.Weight, y: u64, part: u64, out: cuda.qmmf.Out) !void {
+        if (prompt and k.native_lane.takesPromptMx(w)) return k.native_lane.matmulPromptMx(s, x, ldx, m, w, y, out);
+        return k.nativeMatmul(s, x, ldx, m, w, y, part, out);
     }
 
     /// TF_FLASHNEXT_PROFILE=1: each chunk's wall time (synchronized) and its host n-gram gather on stderr.

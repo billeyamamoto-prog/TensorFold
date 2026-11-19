@@ -3,9 +3,11 @@ const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const vision = @import("qwen_cuda.zig");
-pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4 };
+/// The image rows one request holds in all (each image keeps one tower call's 4,096 at most).
+pub const max_image_tokens = 16384;
+pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4, video_tokens: u32 = 0, max_videos: u32 = 0, max_frames: u32 = 0 };
 pub fn checkLimits(l: Limits) !void {
-    if (l.image_tokens == 0 or l.image_tokens > 4096 or l.max_images == 0 or l.max_images > 64)
+    if (l.image_tokens == 0 or l.image_tokens > max_image_tokens or l.max_images == 0 or l.max_images > 64)
         return error.BadImageLimits;
 }
 pub const Run = extern struct {
@@ -64,16 +66,20 @@ pub fn placeholders(a: std.mem.Allocator, c: vision.Config, ids: []const u32, im
     errdefer p.deinit();
     var j: usize = 0;
     for (ids, 0..) |id, at| {
-        if (c.video_token) |video| if (id == video) return error.QwenVideoUnsupported;
         if (j < p.runs.len and at == p.runs[j].at) {
             const r = p.runs[j];
             const im = images[j];
             if (im.tokens != r.tokens() or im.pixels.len != r.patches() * vision.patch_width) return error.BadImagePatches;
             if (ids[at - 1] != c.vision_start or ids[at + r.tokens()] != c.vision_end) return error.BadImagePlaceholders;
-            for (ids[at..][0..r.tokens()]) |x| if (x != c.image_token) return error.BadImagePlaceholders;
+            // an image group's rows are <|image_pad|>; a video group's are <|video_pad|>
+            const mark = ids[at];
+            if (mark != c.image_token and (c.video_token == null or mark != c.video_token.?))
+                return error.BadImagePlaceholders;
+            for (ids[at..][0..r.tokens()]) |x| if (x != mark) return error.BadImagePlaceholders;
             j += 1;
         }
-        if (id == c.image_token and p.src[at] < 0) return error.BadImagePlaceholders;
+        if ((id == c.image_token or (c.video_token != null and id == c.video_token.?)) and p.src[at] < 0)
+            return error.BadImagePlaceholders;
     }
     return p;
 }
@@ -200,5 +206,17 @@ test "an image plan bounds its grids, counts and limits, and lays out interleave
     try std.testing.expectError(error.BadImagePlaceholders, Plan.init(a, 5, &.{.{ .at = 2, .gh = 4, .gw = 4 }}, .{}));
     try std.testing.expectError(error.BadImageCount, Plan.init(a, 20, &.{ .{ .at = 2, .gh = 2, .gw = 2 }, .{ .at = 8, .gh = 2, .gw = 2 } }, .{ .max_images = 1 }));
     try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .max_images = 65 }));
-    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = 4097 }));
+    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = max_image_tokens + 1 }));
+    try checkLimits(.{ .image_tokens = max_image_tokens, .max_images = 64 });
+}
+
+test "a request's images share the configured token budget, each at most one tower call's" {
+    const a = std.testing.allocator;
+    const runs = [_]Run{ .{ .at = 2, .gh = 128, .gw = 128 }, .{ .at = 5000, .gh = 128, .gw = 128 }, .{ .at = 9500, .gh = 128, .gw = 128 } };
+    var p = try Plan.init(a, 14000, &runs, .{ .image_tokens = max_image_tokens, .max_images = 4 });
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 3 * 4096), p.rows);
+    try std.testing.expectEqual(@as(i32, 2 * 4096), p.src[9500]);
+    try std.testing.expectError(error.BadImageGrid, Plan.init(a, 14000, &runs, .{ .max_images = 4 }));
+    try std.testing.expectError(error.BadImageGrid, Plan.init(a, 14000, &.{.{ .at = 2, .gh = 130, .gw = 128 }}, .{ .image_tokens = max_image_tokens }));
 }

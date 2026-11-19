@@ -129,8 +129,8 @@ pub fn Pass(comptime Tri: type) type {
 
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
-            if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
+            if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk, self.hooks.prompt)) |one| return one;
+            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.hooks.prompt);
         }
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
             return ops.sumSlices(self.k, self.stream, part, out, bf16, n, sk);
@@ -390,7 +390,13 @@ pub fn Pass(comptime Tri: type) type {
             const ikc = self.seq.ikc[ai].ptr;
             const pooled = self.seq.pooled[ai].ptr;
             const pg = self.seq.pg;
-            if (self.seq.media) |m| try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, h, pg) else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0, h, pg);
+            // --kv-cache fp8: the same writes into e4m3 rows (cuda_kv.zig); the reads below take the matching kernels
+            const fp8 = self.seq.kv == .fp8;
+            if (self.seq.media) |m| {
+                if (fp8) try m.attnKv8(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, h, pg) else try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, h, pg);
+            } else if (fp8) {
+                try self.tri.attnPrepKv8(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, h, pg);
+            } else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0, h, pg);
             // attention.qsa_pool for the blocks these rows complete, then each block of rows' scores and attention
             if (self.seq.media) |m| try m.pooled(self.stream, ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg) else try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg);
             const nb = scoreStride(self.seq.cap);
@@ -423,11 +429,17 @@ pub fn Pass(comptime Tri: type) type {
                     try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
                     if (!fused) {
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
-                        try self.tri.attnChunks(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
+                        if (fp8) {
+                            try self.tri.attnChunksKv8(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
+                        } else try self.tri.attnChunks(at.q + r0 * qr, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, h, chunks, true, pg);
                         try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * qr, s.qnk, s.qspr, m, h, true);
                     }
                 }
-                if (fused) try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
+                if (fused) {
+                    if (fp8) {
+                        try self.tri.attnFusedKv8(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
+                    } else try self.tri.attnFused(at.q + g0 * qr, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * qr, s.qids, s.qnk, s.qspr, gm, h, pg);
+                }
             }
         }
 

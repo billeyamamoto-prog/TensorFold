@@ -59,7 +59,12 @@ pub fn Namespace(comptime Tri: type) type {
             pub const min_gap: u32 = 256;
             pub const min_prompt: u32 = 512;
         };
-        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false };
+        /// The MTP head cache's format for a drafting stream of `cap` positions (cuda_mtp_draft.zig headFormat).
+        fn headKv(self: *const Cuda, cap: usize) @import("cuda_kv.zig").Kv {
+            const window = @min(self.context + mtp.max_rows, prompt.max_tokens);
+            return mtp.headFormat(self.engine.kv, cap, window, self.head.?.ids.len, self.engine.chunk, self.engine.heads);
+        }
+        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false, kv8: bool = false };
         /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
         pub const slide = slide_mod.Slide(Tri);
         /// The first file a lesson would rewrite through a link, or null: a teaching copy may hard-link the others.
@@ -307,8 +312,8 @@ pub fn Namespace(comptime Tri: type) type {
                 }
                 if (drafting and from != .pool and l.part_seq != null) {
                     l.part_draft = try Parts.take(&self.parts.drafts, self.engine.driver, mtp.Draft.partsBytes(self.head.?.ids.len, self.engine.chunk, self.engine.heads));
-                    l.draft = try mtp.Draft.initParts(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, l.part_draft.?);
-                } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads);
+                    l.draft = try mtp.Draft.initPartsKv(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, l.part_draft.?, headKv(self, cap));
+                } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.initKv(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, headKv(self, cap));
                 if (s.images.len != 0) {
                     const v = self.vision orelse return error.VisionNotEnabled;
                     l.seq.media = try v.state(ids, s.images);

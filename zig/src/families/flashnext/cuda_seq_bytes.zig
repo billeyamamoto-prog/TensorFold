@@ -4,6 +4,7 @@ const wt = @import("cuda_prompt_wt.zig");
 const gdn = @import("cuda_gdn.zig");
 const pages = @import("cuda_pages.zig");
 const Heads = @import("cuda_heads.zig").Heads;
+const Kv = @import("cuda_kv.zig").Kv;
 
 const linear_n = wt.linear_n;
 const attn_n = wt.attn_n;
@@ -44,6 +45,15 @@ fn attnBytes(cap: usize, h: Heads) usize {
 pub fn seqBytes(cap: usize, h: Heads) usize {
     const linear = linear_n * (convBytes(h) + stateBytes(h));
     return linear + attnBytes(cap, h) + wt.ple_tail_n * wt.wide * 2;
+}
+
+/// seqBytes with the attention caches in format `format` (--kv-cache): 1,056 bytes a position and layer for fp8 keys and
+/// values. fp8 caches hold the whole layer's KV heads (one rank, contiguous).
+pub fn seqBytesFor(format: Kv, cap: usize, h: Heads) usize {
+    if (format == .bf16) return seqBytes(cap, h);
+    const linear = linear_n * (convBytes(h) + stateBytes(h));
+    const attn = attn_n * (cap * format.kvRow() + indexBytes(cap) + pooledBytes(cap));
+    return linear + attn + wt.ple_tail_n * wt.wide * 2;
 }
 
 /// Contiguous storage or the page diagnostic's rounded arena and table, with every live allocation priced.
@@ -88,4 +98,15 @@ test "the page diagnostic prices the whole layer's pages and refuses a rank's ha
     try std.testing.expectError(error.FlashNextPagesUnsupported, seqBytesPaged(64, 16, .half));
     try std.testing.expect(try seqBytesPaged(64, 16, .full) > 0);
     try std.testing.expectError(error.BadFlashNextPageTest, seqBytesPaged(0, 0, .half));
+}
+
+test "fp8 caches take 1,056 + 256 bytes a position and layer, and the pooled blocks stay bf16" {
+    const per_token = attn_n * (Kv.fp8.kvRow() + index_dim * 2);
+    try std.testing.expectEqual(per_token, seqBytesFor(.fp8, 6, .full) - seqBytesFor(.fp8, 5, .full));
+    try std.testing.expectEqual(per_token + attn_n * index_dim * 2, seqBytesFor(.fp8, 5, .full) - seqBytesFor(.fp8, 4, .full));
+    // the default format is the one seqBytes always had
+    for ([_]usize{ 0, 1, 4, 5, 4096, max_tokens }) |cap| try std.testing.expectEqual(seqBytes(cap, .full), seqBytesFor(.bf16, cap, .full));
+    // 12 layers of 1,056 bytes a token against 2,048 (the MTP head's layer is counted by its draft cache)
+    const d = seqBytesFor(.bf16, max_tokens, .full) - seqBytesFor(.fp8, max_tokens, .full);
+    try std.testing.expectEqual(max_tokens * attn_n * (2048 - 1056), d);
 }
